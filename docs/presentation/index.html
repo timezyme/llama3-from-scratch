@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Llama 3 From Scratch — Guided Tour</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { text-align: center; padding: 30px 0 10px; color: #d4a574; font-size: 2em; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 30px; font-size: 1.1em; }
+  .slide { display: none; }
+  .slide.active { display: block; }
+  .slide-header { text-align: center; margin-bottom: 20px; }
+  .step-num { color: #d4a574; font-size: 0.9em; text-transform: uppercase; letter-spacing: 2px; }
+  .slide-header h2 { color: #fff; font-size: 1.5em; margin-top: 5px; }
+  .slide-body { text-align: center; }
+  .slide-body img { max-width: 100%; border-radius: 8px; border: 1px solid #333; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+  .description { margin-top: 20px; padding: 15px 30px; color: #ccc; line-height: 1.6; font-size: 1.05em; max-width: 800px; margin-left: auto; margin-right: auto; text-align: left; }
+  .nav { display: flex; justify-content: center; align-items: center; gap: 20px; margin-top: 25px; padding-bottom: 30px; }
+  .nav button { background: #d4a574; color: #1a1a2e; border: none; padding: 10px 25px; border-radius: 6px; font-size: 1em; cursor: pointer; font-weight: 600; }
+  .nav button:hover { background: #e0b888; }
+  .nav button:disabled { background: #444; color: #666; cursor: default; }
+  .dots { display: flex; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #444; cursor: pointer; transition: background 0.2s; }
+  .dot.active { background: #d4a574; }
+  .counter { color: #888; font-size: 0.95em; }
+  kbd { background: #333; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Llama 3 From Scratch</h1>
+  <p class="subtitle">A guided tour of the C++17/CUDA inference pipeline — 14 steps</p>
+  
+    <div class="slide active" id="slide-1">
+      <div class="slide-header">
+        <span class="step-num">Step 1 of 14</span>
+        <h2>Entry Point: Where Inference Begins</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-01.png" alt="Entry Point: Where Inference Begins" />
+        <p class="description">main.cpp is the application entry point that wires together the inference pipeline. It instantiates a BPETokenizer using paths from config.h and demonstrates the encode/decode round-trip. This is your launching pad for understanding how text becomes tokens and eventually model output.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-2">
+      <div class="slide-header">
+        <span class="step-num">Step 2 of 14</span>
+        <h2>Foundation: Configuration Constants</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-02.png" alt="Foundation: Configuration Constants" />
+        <p class="description">config.h defines the project-wide constants that every subsystem depends on: the tokenizer model file path, the embedding dimension (4096 for Llama 3 8B), and the RMS normalization epsilon. With a fan-in of 4, this is the second most depended-upon file in the codebase.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-3">
+      <div class="slide-header">
+        <span class="step-num">Step 3 of 14</span>
+        <h2>Foundation: The Common Prelude</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-03.png" alt="Foundation: The Common Prelude" />
+        <p class="description">prelude.h is the most imported file in the project (fan-in of 6). It provides type aliases and STL using-declarations that establish the vocabulary used across every layer. By standardizing types here, the codebase avoids redundant includes and inconsistent type names.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-4">
+      <div class="slide-header">
+        <span class="step-num">Step 4 of 14</span>
+        <h2>Tokenizer Interface: Defining the Contract</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-04.png" alt="Tokenizer Interface: Defining the Contract" />
+        <p class="description">tokenizer.h declares the abstract LLMTokenizer interface and the concrete BPETokenizer subclass. This header is imported by main.cpp, the test bridge, and the BPE implementation itself, making it the central contract for all text-to-token operations.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-5">
+      <div class="slide-header">
+        <span class="step-num">Step 5 of 14</span>
+        <h2>Tokenizer Implementation: BPE Merge Loop</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-05.png" alt="Tokenizer Implementation: BPE Merge Loop" />
+        <p class="description">tokenizer_bpe.cpp implements the full BPE pipeline: loading the tokenizer.model file, encoding strings via a greedy merge loop that iteratively combines the highest-priority byte pairs, and decoding token IDs back to text. This is the first stage of the inference pipeline.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-6">
+      <div class="slide-header">
+        <span class="step-num">Step 6 of 14</span>
+        <h2>Weight Loader Interface</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-06.png" alt="Weight Loader Interface" />
+        <p class="description">loader.h declares the LlamaDumpLoader class responsible for reading binary-dumped model weights from disk. It depends on prelude.h for common types. The loader is consumed by both the test bridge and the main application to hydrate model parameters.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-7">
+      <div class="slide-header">
+        <span class="step-num">Step 7 of 14</span>
+        <h2>Float Conversion Utilities</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-07.png" alt="Float Conversion Utilities" />
+        <p class="description">milifloat.h provides bf16_to_float and half_to_float converters used during weight deserialization. Llama 3 weights are stored in BFloat16 format for space efficiency, but computation requires FP32. This header is a dependency of loader.cpp with a fan-in of 2.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-8">
+      <div class="slide-header">
+        <span class="step-num">Step 8 of 14</span>
+        <h2>Weight Loader Implementation</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-08.png" alt="Weight Loader Implementation" />
+        <p class="description">loader.cpp implements the binary weight parser: it reads 256-byte tensor headers, determines the data type (BF16/FP16/FP32), converts to float using milifloat.h utilities, and populates embedding matrices. With fan-out of 3, it bridges the interface and float-conversion layers.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-9">
+      <div class="slide-header">
+        <span class="step-num">Step 9 of 14</span>
+        <h2>GPU Operator Base Class</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-09.png" alt="GPU Operator Base Class" />
+        <p class="description">operator.cuh defines the AbstractOperator base class that GPU operators inherit from. It imports both config.h and prelude.h, establishing the interface contract for any operation that runs on the GPU. This is the foundation for the compute layer.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-10">
+      <div class="slide-header">
+        <span class="step-num">Step 10 of 14</span>
+        <h2>Kernel Signatures: The GPU API Surface</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-10.png" alt="Kernel Signatures: The GPU API Surface" />
+        <p class="description">kernels.cuh forward-declares the CUDA kernel signatures including matmul_kernel and the gpu_matmul wrapper. With fan-in of 3 (from matmul.cu, matmul_cpu.cpp, and test_api.cpp), it serves as the single contract that both GPU and CPU implementations satisfy.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-11">
+      <div class="slide-header">
+        <span class="step-num">Step 11 of 14</span>
+        <h2>CUDA Matrix Multiplication Kernel</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-11.png" alt="CUDA Matrix Multiplication Kernel" />
+        <p class="description">matmul.cu is the performance-critical heart of the project: a double-buffered tiled GEMM kernel using 128x128 thread blocks, shared memory staging, and float4 vectorized loads for coalesced memory access. This kernel powers the linear layers in Llama 3's transformer blocks.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-12">
+      <div class="slide-header">
+        <span class="step-num">Step 12 of 14</span>
+        <h2>CPU Matmul Fallback</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-12.png" alt="CPU Matmul Fallback" />
+        <p class="description">matmul_cpu.cpp provides a CPU fallback implementation of gpu_matmul using a triple-nested loop with cache-friendly (i,k,j) ordering. The Makefile auto-detects nvcc and selects this fallback when no GPU compiler is available, ensuring the project builds anywhere.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-13">
+      <div class="slide-header">
+        <span class="step-num">Step 13 of 14</span>
+        <h2>Test Harness and Grading Bridge</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-13.png" alt="Test Harness and Grading Bridge" />
+        <p class="description">The testing layer has three files working together: test.cpp is the read-only harness with 7 graded tests, test_api.h declares the TestAPI interface, and test_api.cpp is the student-written bridge that wires BPETokenizer, LlamaDumpLoader, and gpu_matmul to the test harness. test_api.cpp has the highest fan-out (8) in the entire codebase, touching every major subsystem.</p>
+      </div>
+    </div>
+    <div class="slide " id="slide-14">
+      <div class="slide-header">
+        <span class="step-num">Step 14 of 14</span>
+        <h2>Python Tooling: Weight Pipeline</h2>
+      </div>
+      <div class="slide-body">
+        <img src="step-14.png" alt="Python Tooling: Weight Pipeline" />
+        <p class="description">The Python tools form an offline data pipeline: llama3_downloader.py fetches Llama 3 8B weights from Hugging Face, dumper.py converts safetensors to the custom binary format that loader.cpp reads, and token_show.py provides a reference HF tokenizer for validating the C++ BPE implementation. These tools have no C++ dependencies at runtime.</p>
+      </div>
+    </div>
+  <div class="nav">
+    <button id="prev" onclick="prev()" disabled>Prev</button>
+    <div class="dots"><span class="dot active" onclick="goToSlide(1)"></span><span class="dot " onclick="goToSlide(2)"></span><span class="dot " onclick="goToSlide(3)"></span><span class="dot " onclick="goToSlide(4)"></span><span class="dot " onclick="goToSlide(5)"></span><span class="dot " onclick="goToSlide(6)"></span><span class="dot " onclick="goToSlide(7)"></span><span class="dot " onclick="goToSlide(8)"></span><span class="dot " onclick="goToSlide(9)"></span><span class="dot " onclick="goToSlide(10)"></span><span class="dot " onclick="goToSlide(11)"></span><span class="dot " onclick="goToSlide(12)"></span><span class="dot " onclick="goToSlide(13)"></span><span class="dot " onclick="goToSlide(14)"></span></div>
+    <button id="next" onclick="next()">Next</button>
+  </div>
+  <p style="text-align:center;color:#555;font-size:0.85em;padding-bottom:20px;">Use <kbd>←</kbd> <kbd>→</kbd> arrow keys to navigate</p>
+</div>
+<script>
+let current = 1;
+const total = 14;
+function goToSlide(n) {
+  document.getElementById('slide-'+current).classList.remove('active');
+  document.querySelectorAll('.dot')[current-1].classList.remove('active');
+  current = n;
+  document.getElementById('slide-'+current).classList.add('active');
+  document.querySelectorAll('.dot')[current-1].classList.add('active');
+  document.getElementById('prev').disabled = current === 1;
+  document.getElementById('next').disabled = current === total;
+}
+function next() { if (current < total) goToSlide(current + 1); }
+function prev() { if (current > 1) goToSlide(current - 1); }
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') next();
+  if (e.key === 'ArrowLeft') prev();
+});
+</script>
+</body>
+</html>
