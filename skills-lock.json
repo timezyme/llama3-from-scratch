@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "cuda": {
+      "source": "technillogue/ptx-isa-markdown",
+      "sourceType": "github",
+      "computedHash": "b615fcd919d1f5f041527905d71fc14694b4c58c83a78d286a4a2d98ad2a47c2"
+    },
+    "cuda-kernels": {
+      "source": "huggingface/kernels",
+      "sourceType": "github",
+      "computedHash": "e97208c84d5a91ad2bc7ea610893de45f2bd693c0a9cd485fd66a7b851707bfb"
+    },
+    "humanizer": {
+      "source": "softaworks/agent-toolkit",
+      "sourceType": "github",
+      "computedHash": "34a38e6acc60d4529612d41ffe740bca0060d3c5e89e2a0d24ae795f67157fbb"
+    }
+  }
+}
