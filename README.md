@@ -4,8 +4,6 @@ From-scratch Llama 3 8B inference in C++17/CUDA. No ML framework dependencies at
 
 **Milestone 1: Complete** — all 7 tests passing on GCP T4.
 
-Questions? Post on Ed or email milad@g.harvard.edu.
-
 ## Prerequisites
 
 - **Local (macOS M4)**: Xcode command line tools (`xcode-select --install`), Python 3.10+
