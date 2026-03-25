@@ -217,7 +217,3 @@ include/operator.cuh     # AbstractOperator base class
 kernel/kernels.cuh       # CUDA kernel signatures
 config.h                 # Constants (paths, dims, epsilon)
 ```
-
-## Read-only files (grading)
-
-Don't modify: `tests/test.cpp`, `tests/test_api.h`, `tools/llama3_downloader.py`, `tools/token_show.py`
