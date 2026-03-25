@@ -1,50 +1,51 @@
-# CS265 LLM Inference Project
+# Llama 3 From Scratch
 
 From-scratch Llama 3 8B inference in C++17/CUDA. No ML framework dependencies at runtime.
 
-**Milestone 1: Complete** — all 7 tests passing on GCP T4.
+The pipeline covers tokenization (BPE with greedy merge), weight loading (BF16/FP16/FP32 via mmap), and matrix multiplication (double-buffered tiled GEMM on CUDA, with a CPU fallback). A Python toolchain handles downloading and converting the model weights offline.
 
-## Prerequisites
+## Guided tour
 
-- **Local (macOS M4)**: Xcode command line tools (`xcode-select --install`), Python 3.10+
-- **GPU testing**: GCP account with billing enabled, `gcloud` CLI installed
-- **Model access**: Hugging Face account with Llama 3 8B Instruct access approved at https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct
-- **HF token**: Generate at https://huggingface.co/settings/tokens, place in `.env` as `HUGGINGFACE_TOKEN=hf_...`
+There's a 14-step visual walkthrough of the codebase in [`docs/presentation/`](docs/presentation/index.html). Open `index.html` in a browser and use the arrow keys to navigate.
 
-## Local setup (macOS, no GPU)
+## Quick start
 
 ```bash
-# Install Python deps
-pip install -r requirements.txt
-
-# Build (CPU-only, auto-detects no nvcc)
+# Build (CPU-only if nvcc is not found)
 make                    # release build → bin/llm
-make BUILD=debug        # debug build
 make tests              # test binary → bin/tests
-make clean              # remove build/ and bin/
 
-# Run tokenizer test (requires assets/llama3/token.model)
+# Run a test (requires model assets)
 ./bin/tests 1
 ```
 
-The Makefile auto-detects `nvcc`. Without it, the CPU matmul fallback (`kernel/matmul_cpu.cpp`) is used.
+## Prerequisites
 
-## GCP GPU VM
+- C++17 compiler and Python 3.10+ (macOS or Linux)
+- CUDA toolkit with `nvcc` for GPU builds
+- Hugging Face account with [Llama 3 8B Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) access approved
+- HF token (generate at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)), placed in `.env` as `HUGGINGFACE_TOKEN=hf_...`
 
-### Auth and project setup
+## Build commands
 
 ```bash
-# Authenticate
-gcloud auth login
-
-# Set project (must have billing enabled)
-gcloud config set project timezyme-document-processing
+make                    # release build (-O2) → bin/llm
+make BUILD=debug        # debug build (-g -O0)
+make tests              # test binary → bin/tests
+make clean              # remove build/ and bin/
 ```
 
-### Create VM (first time)
+## GCP GPU VM setup
+
+You need a GPU to run the CUDA kernels. These instructions use a GCP spot instance with an NVIDIA T4 (~$0.16/hr).
+
+### Create the VM
 
 ```bash
-gcloud compute instances create cs265-gpu-test \
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+
+gcloud compute instances create llama3-gpu \
   --zone=us-central1-a \
   --machine-type=n1-standard-4 \
   --accelerator=type=nvidia-tesla-t4,count=1 \
@@ -58,17 +59,13 @@ gcloud compute instances create cs265-gpu-test \
   --scopes=default
 ```
 
-**Cost**: ~$0.16/hr (spot pricing). Stop when not in use.
-
 ### First-time VM setup
 
 ```bash
-# SSH in
-gcloud compute ssh cs265-gpu-test --zone=us-central1-a
+gcloud compute ssh llama3-gpu --zone=us-central1-a
 
 # On the VM:
-sudo apt-get update -qq && sudo apt-get install -y -qq build-essential
-sudo apt-get install -y -qq python3-pip
+sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3-pip
 pip3 install huggingface_hub safetensors numpy torch --index-url https://download.pytorch.org/whl/cpu
 
 echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
@@ -79,41 +76,30 @@ source ~/.bashrc
 ### Start / stop VM
 
 ```bash
-# Start
-gcloud compute instances start cs265-gpu-test --zone=us-central1-a
-
-# Stop (preserves disk, ~$0.005/hr for disk only)
-gcloud compute instances stop cs265-gpu-test --zone=us-central1-a
-
-# Delete (zero cost, must recreate from scratch)
-gcloud compute instances delete cs265-gpu-test --zone=us-central1-a
+gcloud compute instances start llama3-gpu --zone=us-central1-a
+gcloud compute instances stop llama3-gpu --zone=us-central1-a    # ~$0.005/hr disk only
+gcloud compute instances delete llama3-gpu --zone=us-central1-a  # zero cost
 ```
 
-### Copy project to VM
+### Copy project to the VM
 
 ```bash
-# Full project (run from project root)
-gcloud compute scp --recurse --zone=us-central1-a \
-  . cs265-gpu-test:~/CS265
-
-# Single file update
-gcloud compute scp --zone=us-central1-a \
-  src/loader.cpp cs265-gpu-test:~/CS265/src/loader.cpp
+gcloud compute scp --recurse --zone=us-central1-a . llama3-gpu:~/llama3
+gcloud compute scp --zone=us-central1-a src/loader.cpp llama3-gpu:~/llama3/src/loader.cpp
 ```
 
 ## Model download and weight dumping
 
-### Download Llama 3 8B (on VM, ~90 seconds)
+### Download Llama 3 8B (~90 seconds on VM)
 
 ```bash
-gcloud compute ssh cs265-gpu-test --zone=us-central1-a
-cd ~/CS265
+cd ~/llama3
 HF_TOKEN=<your-token> python3 tools/llama3_downloader.py --out ./assets/llama3/
 ```
 
 ### Generate token.model
 
-The HF download gives you `tokenizer.json` (GPT-style byte encoding), but the C++ tokenizer needs a raw-byte rank file. Convert it:
+The Hugging Face download gives you `tokenizer.json` (GPT-style byte encoding), but the C++ tokenizer expects a raw-byte rank file. This script converts it:
 
 ```bash
 python3 -c "
@@ -161,33 +147,29 @@ print(f'Wrote {len(vocab)} entries')
 python3 tools/dumper.py
 # Outputs 291 tensors to assets/llama3/dump/
 # Embeddings: assets/llama3/dump/embeddings.bin
-# Layers: assets/llama3/dump/layer_XX/
-# Global: assets/llama3/dump/global/
-# Manifest: assets/llama3/dump/manifest.json
+# Layers:     assets/llama3/dump/layer_XX/
+# Global:     assets/llama3/dump/global/
+# Manifest:   assets/llama3/dump/manifest.json
 ```
 
-## Building and testing on VM
+## Building and testing on the VM
 
 ```bash
-gcloud compute ssh cs265-gpu-test --zone=us-central1-a
-cd ~/CS265
+gcloud compute ssh llama3-gpu --zone=us-central1-a
+cd ~/llama3
 export PATH=/usr/local/cuda/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# Build
 make clean && make tests
-
-# Run grading test
 ./bin/tests 1    # tokenize "Hello world" → [128000, 9906, 1917]
 
-# Build main binary
 make
 ./bin/llm
 ```
 
-## Test results (Milestone 1)
+## Test results
 
-All 7 passing on GCP T4 (`n1-standard-4`).
+All 7 tests pass on a GCP T4 (n1-standard-4).
 
 | Test | Description | Result |
 |------|-------------|--------|
@@ -202,18 +184,30 @@ All 7 passing on GCP T4 (`n1-standard-4`).
 ## Project structure
 
 ```
-src/tokenizer_bpe.cpp    # BPE tokenizer (encode/decode)
-src/loader.cpp           # Weight loader (mmap, BF16→FP32)
-tools/dumper.py          # Safetensors → binary dump (Python)
-kernel/matmul.cu         # CUDA tiled GEMM kernel
-kernel/matmul_cpu.cpp    # CPU fallback (no GPU builds)
-tests/test_api.cpp       # TestAPI implementation
-tests/test.cpp           # Test harness (DO NOT MODIFY)
-tests/test_api.h         # Test API header (DO NOT MODIFY)
-include/loader.h         # LlamaDumpLoader declarations
-include/tokenizer.h      # BPETokenizer declarations
-include/milifloat.h      # BF16/FP16 → FP32 converters
-include/operator.cuh     # AbstractOperator base class
-kernel/kernels.cuh       # CUDA kernel signatures
+main.cpp                 # Entry point
 config.h                 # Constants (paths, dims, epsilon)
+include/
+  prelude.h              # Common type aliases and STL imports
+  tokenizer.h            # BPETokenizer interface
+  loader.h               # LlamaDumpLoader declarations
+  milifloat.h            # BF16/FP16 → FP32 converters
+  operator.cuh           # AbstractOperator base class
+src/
+  tokenizer_bpe.cpp      # BPE tokenizer (encode/decode)
+  loader.cpp             # Weight loader (mmap, BF16→FP32)
+kernel/
+  kernels.cuh            # CUDA kernel signatures
+  matmul.cu              # Tiled GEMM kernel (double-buffered, shared memory)
+  matmul_cpu.cpp         # CPU fallback for non-CUDA builds
+tests/
+  test.cpp               # Test harness (7 tests)
+  test_api.h             # TestAPI interface
+  test_api.cpp           # TestAPI implementation (tokenize, embed, matmul)
+tools/
+  llama3_downloader.py   # Download weights from Hugging Face
+  dumper.py              # Safetensors → binary dump
+  token_show.py          # Token inspection utility
+docs/
+  presentation/          # Interactive guided tour of the codebase
+  Milestone1-Report.pdf  # Project report
 ```
