@@ -12,6 +12,7 @@ gold/
 
 .agent/
 .agents/
+.serena/
 .claude/
 .cursor/
 .understand-anything/
