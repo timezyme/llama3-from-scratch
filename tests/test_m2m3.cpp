@@ -190,23 +190,17 @@ static std::vector<float> load_fixture(const std::string &path, size_t count) {
 // loader: LlamaDumpLoader with embeddings already loaded.
 // h_x_last: [EMBEDDING_DIM] host memory.
 // Returns: [VOCAB_SIZE] logits on host.
-static std::vector<float> compute_lm_head_logits(LlamaDumpLoader &loader,
+// Compute logits using the lm_head output projection weight [VOCAB_SIZE, EMBEDDING_DIM].
+// logits[v] = dot(lm_head[v, :], h_x_last).
+static std::vector<float> compute_lm_head_logits(const float *lm_head,
                                                   const float *h_x_last) {
     std::vector<float> logits(VOCAB_SIZE);
-    const size_t batch = 1024;
-    for (size_t start = 0; start < (size_t)VOCAB_SIZE; start += batch) {
-        size_t end = std::min(start + batch, (size_t)VOCAB_SIZE);
-        std::vector<int> ids;
-        for (size_t v = start; v < end; ++v)
-            ids.push_back(static_cast<int>(v));
-        std::unique_ptr<float[]> rows(loader.get_embeddings(ids));
-        for (size_t v = start; v < end; ++v) {
-            float dot = 0.0f;
-            const float *row = rows.get() + (v - start) * EMBEDDING_DIM;
-            for (int j = 0; j < EMBEDDING_DIM; ++j)
-                dot += h_x_last[j] * row[j];
-            logits[v] = dot;
-        }
+    for (int v = 0; v < VOCAB_SIZE; ++v) {
+        float dot = 0.0f;
+        const float *row = lm_head + (size_t)v * EMBEDDING_DIM;
+        for (int j = 0; j < EMBEDDING_DIM; ++j)
+            dot += h_x_last[j] * row[j];
+        logits[v] = dot;
     }
     return logits;
 }
@@ -1515,7 +1509,7 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
     CUDA_CHECK(cudaMemcpy(h_Xfinal.data(), d_Xnorm, bytes_X,
                            cudaMemcpyDeviceToHost));
     const float *x_last = h_Xfinal.data() + (seq_len - 1) * d;
-    auto logits = compute_lm_head_logits(weights.loader(), x_last);
+    auto logits = compute_lm_head_logits(weights.global().lm_head, x_last);
     int argmax = static_cast<int>(
         std::max_element(logits.begin(), logits.end()) - logits.begin());
 
@@ -1650,9 +1644,9 @@ static int test_lm_head_last_token_only() {
     fill_deterministic(h_hidden.data() + 2 * d, d, /*seed=*/7); // row 2
 
     // Project row 0 and row 2 through the shared helper
-    auto logits_row0 = compute_lm_head_logits(weights.loader(),
+    auto logits_row0 = compute_lm_head_logits(weights.global().lm_head,
                                                h_hidden.data());
-    auto logits_row2 = compute_lm_head_logits(weights.loader(),
+    auto logits_row2 = compute_lm_head_logits(weights.global().lm_head,
                                                h_hidden.data() + 2 * d);
 
     // Check size
@@ -1702,21 +1696,20 @@ static int test_weight_sharing_check() {
     fill_deterministic(h_x.data(), d, /*seed=*/123);
 
     // Compute full logits via the shared helper
-    auto logits = compute_lm_head_logits(weights.loader(), h_x.data());
+    auto logits = compute_lm_head_logits(weights.global().lm_head, h_x.data());
 
-    // Sample a few token IDs and compute reference dot products manually
+    // Verify by manually computing dot products against lm_head rows for sampled IDs
     std::vector<int> sample_ids = {42, 1337, 2048};
-    std::unique_ptr<float[]> emb_rows(
-        weights.get_embeddings(sample_ids));
+    const float *lm_head = weights.global().lm_head;
 
     for (size_t k = 0; k < sample_ids.size(); ++k) {
         float dot = 0.0f;
-        const float *row = emb_rows.get() + k * d;
+        const float *row = lm_head + (size_t)sample_ids[k] * d;
         for (int j = 0; j < d; ++j)
             dot += h_x[j] * row[j];
 
         float diff = std::fabs(logits[sample_ids[k]] - dot);
-        if (diff > 1e-2f) {
+        if (diff > 1e-5f) {
             std::printf("  token %d: helper=%.6f manual=%.6f diff=%.6f\n",
                         sample_ids[k], logits[sample_ids[k]], dot, diff);
             std::printf("FAIL weight_sharing_check\n");

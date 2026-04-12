@@ -40,13 +40,14 @@ struct LayerWeights {
 
 // Global model weights shared across all layers.
 struct GlobalWeights {
-    // Embedding table: [VOCAB_SIZE, EMBEDDING_DIM].
-    // Also serves as lm_head weights (weight tying in Llama 3).
-    // NOT transposed: used for both row lookup and last-token projection.
-    // Managed by LlamaDumpLoader's embedding cache, not owned here.
-
     // Final RMSNorm weight before the output layer.
     float *final_norm = nullptr;  // [EMBEDDING_DIM]
+
+    // Output projection (lm_head): [VOCAB_SIZE, EMBEDDING_DIM].
+    // Llama 3 Instruct does NOT tie lm_head to the embedding table
+    // (config.json: tie_word_embeddings = false).
+    // Stored as loaded (row-major [V, d]); logits = lm_head @ x_last.
+    float *lm_head = nullptr;    // [VOCAB_SIZE * EMBEDDING_DIM]
 };
 
 // Loads and manages all Llama 3 8B model weights.

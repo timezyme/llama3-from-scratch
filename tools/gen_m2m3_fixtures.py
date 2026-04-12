@@ -343,9 +343,10 @@ def main():
     X_final = rmsnorm(X_cur, final_gamma)
     save_fixture("final_hidden.bin", X_final)
 
-    # Last-token logits: x_last @ emb_table^T (lm_head = embedding table)
+    # Last-token logits: x_last @ lm_head^T (NOT embedding table; weights are untied)
+    lm_head = read_dump(os.path.join(DUMP_DIR, "global", "lm_head_weight.bin"))
     x_last = X_final[-1, :]  # [4096]
-    logits = x_last @ emb_table.T  # [128256]
+    logits = x_last @ lm_head.T  # [128256]
     next_token = int(np.argmax(logits))
     print(f"\n  next token ID (greedy): {next_token}")
     save_fixture("logits_hello.bin", logits)
@@ -459,7 +460,7 @@ def main():
 
     X_med_final = rmsnorm(X_med_cur, final_gamma)
     x_med_last = X_med_final[-1, :]
-    med_logits = x_med_last @ emb_table.T
+    med_logits = x_med_last @ lm_head.T
     med_token = int(np.argmax(med_logits))
     print(f"  next token ID (greedy): {med_token}")
 

@@ -20,6 +20,8 @@ ModelWeights::~ModelWeights() {
     }
     delete[] global_.final_norm;
     global_.final_norm = nullptr;
+    delete[] global_.lm_head;
+    global_.lm_head = nullptr;
 }
 
 void ModelWeights::load_global() {
@@ -32,6 +34,11 @@ void ModelWeights::load_global() {
     global_.final_norm =
         loader_.load_1d(dump_dir_ + "/global/model_norm_weight.bin",
                         EMBEDDING_DIM);
+
+    // Load the lm_head output projection (NOT tied to embeddings in Llama 3 Instruct).
+    global_.lm_head =
+        loader_.load_2d(dump_dir_ + "/global/lm_head_weight.bin",
+                        VOCAB_SIZE, EMBEDDING_DIM);
 }
 
 float *ModelWeights::get_embeddings(const std::vector<int> &token_ids) {
