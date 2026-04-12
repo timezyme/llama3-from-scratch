@@ -23,8 +23,11 @@
                                      cudaGetErrorString(err));                  \
     } while (0)
 
-// Per-head attention: Q*K^T, scale, mask, softmax, *V -> concat.
-// Runs on GPU per-head with host-side orchestration.
+// Grouped Query Attention (GQA) across all heads.
+// For each query head: extract its Q slice and the matching KV group,
+// compute scaled dot-product attention with causal masking on GPU,
+// and write the result into the concatenated output buffer.
+// Host orchestrates the per-head loop; each head's matmul runs on device.
 static void run_attention_heads(const std::vector<float> &h_Q_rope,
                                 const std::vector<float> &h_K_rope,
                                 const std::vector<float> &h_V,
@@ -104,9 +107,10 @@ static std::vector<float> compute_lm_head_logits(const float *lm_head,
     return logits;
 }
 
-// Run the full 32-layer forward pass on device.
-// h_embeddings: [seq_len, EMBEDDING_DIM] on host.
-// Returns argmax token ID.
+// Run the full 32-layer Llama 3 forward pass.
+// Allocates all device buffers, streams weights one layer at a time,
+// applies final RMSNorm, computes logits via lm_head, and returns argmax.
+// h_embeddings: [seq_len, EMBEDDING_DIM] in host memory.
 static int run_forward_pass(const float *h_embeddings, int seq_len,
                             ModelWeights &weights) {
     const int d = EMBEDDING_DIM;
@@ -162,10 +166,13 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
     CUDA_CHECK(cudaMemcpy(d_sin, h_sin.data(), table_sz * sizeof(float),
                            cudaMemcpyHostToDevice));
 
-    // 32-layer decoder loop
+    // --- 32-layer decoder loop ---
+    // Each layer: pre-norm -> attention -> residual -> post-norm -> FFN -> residual.
+    // Weights are streamed one layer at a time (host -> device) and freed after use.
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const LayerWeights &lw = weights.load_layer(layer);
 
+        // Upload this layer's weights to GPU
         CUDA_CHECK(cudaMemcpy(d_gamma, lw.input_layernorm,
                                d * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_wq, lw.q_proj,
@@ -190,6 +197,7 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
                                (size_t)FFN_DIM * d * sizeof(float),
                                cudaMemcpyHostToDevice));
 
+        // Self-attention block: RMSNorm -> Q/K/V projections -> RoPE -> GQA -> O projection
         gpu_rmsnorm(d_X, d_gamma, d_Xnorm, seq_len, d, RMS_NORM_EPSILON);
         gpu_matmul_device(d_Xnorm, d_wq, d_Q, seq_len, d, d);
         gpu_matmul_device(d_Xnorm, d_wk, d_K, seq_len, d, kv_dim);
@@ -197,7 +205,7 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
         gpu_rope(d_Q, d_cos, d_sin, seq_len, NUM_HEADS, HEAD_DIM);
         gpu_rope(d_K, d_cos, d_sin, seq_len, NUM_KV_HEADS, HEAD_DIM);
 
-        // Attention (per-head loop via host)
+        // GQA attention: runs per-head on GPU, orchestrated from host
         std::vector<float> h_Qr(seq_len * d), h_Kr(seq_len * kv_dim),
             h_Vp(seq_len * kv_dim);
         CUDA_CHECK(cudaMemcpy(h_Qr.data(), d_Q, bytes_X,
@@ -209,11 +217,13 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
         std::vector<float> attn_concat(total, 0.0f);
         run_attention_heads(h_Qr, h_Kr, h_Vp, attn_concat, seq_len);
 
+        // Output projection + residual connection
         CUDA_CHECK(cudaMemcpy(d_attn, attn_concat.data(), bytes_X,
                                cudaMemcpyHostToDevice));
         gpu_matmul_device(d_attn, d_wo, d_attn_out, seq_len, d, d);
         gpu_residual_add(d_X, d_attn_out, static_cast<int>(total));
 
+        // FFN block: RMSNorm -> gate/up projections -> SwiGLU -> down projection
         CUDA_CHECK(cudaMemcpy(d_gamma, lw.post_attn_layernorm,
                                d * sizeof(float), cudaMemcpyHostToDevice));
         gpu_rmsnorm(d_X, d_gamma, d_Xnorm, seq_len, d, RMS_NORM_EPSILON);
@@ -234,7 +244,7 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
                            d * sizeof(float), cudaMemcpyHostToDevice));
     gpu_rmsnorm(d_X, d_gamma, d_Xnorm, seq_len, d, RMS_NORM_EPSILON);
 
-    // Extract last row -> logits via shared lm_head (embedding table dot product)
+    // Extract last position's hidden state -> logits via lm_head projection
     std::vector<float> h_Xfinal(total);
     CUDA_CHECK(cudaMemcpy(h_Xfinal.data(), d_Xnorm, bytes_X,
                            cudaMemcpyDeviceToHost));
