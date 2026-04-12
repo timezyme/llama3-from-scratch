@@ -1,7 +1,8 @@
 // Abstract base class for GPU operators (e.g. attention, FFN, norm).
-// This is a stub — every method throws at runtime to enforce that
-// derived classes provide real implementations for weight transfer
-// and kernel dispatch.
+// Every method throws at runtime to force derived classes to provide
+// real implementations. Not currently used by the inference pipeline
+// (operators are called directly via free functions in kernels.cuh),
+// but kept as a scaffold for future operator encapsulation.
 
 #pragma once
 
@@ -11,34 +12,29 @@
 class AbstractOperator {
   public:
     ~AbstractOperator() {
-        throw runtime_error("Destructor not implemented, beware of "
-                            "weights!, fallback to derived class");
+        throw runtime_error("AbstractOperator::~AbstractOperator not overridden");
     }
 
     AbstractOperator() {
-        throw runtime_error(
-            "Constructor not implemented, fallback to derived class");
+        throw runtime_error("AbstractOperator must be subclassed");
     }
 
     // Transfer weights from host to device memory.
     bool to_gpu() const {
-        throw runtime_error(
-            "to_gpu() not implemented, fallback to derived class");
+        throw runtime_error("AbstractOperator::to_gpu() not overridden");
     }
 
     // Execute the operator's forward pass (launch kernel).
     bool call() {
-        throw runtime_error(
-            "call() not implemented, fallback to derived class");
+        throw runtime_error("AbstractOperator::call() not overridden");
     }
 
     // Check whether weights are currently on the GPU.
     bool is_in_gpu() {
-        throw runtime_error(
-            "is_in_gpu() not implemented, fallback to derived class");
+        throw runtime_error("AbstractOperator::is_in_gpu() not overridden");
     }
 
   private:
-    bool in_gpu = false; // tracks host/device residency
+    bool in_gpu = false;
 };
 
