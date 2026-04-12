@@ -7,6 +7,12 @@
 
 #include <stdexcept>
 
+// CPU builds cannot use device pointers. Fail clearly at runtime.
+void gpu_matmul_device(const float *, const float *, float *,
+                       int, int, int) {
+    throw std::runtime_error("gpu_matmul_device requires CUDA (nvcc build)");
+}
+
 void gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
     if (M < 0 || K < 0 || N < 0) {
         throw std::runtime_error("gpu_matmul expects non-negative dimensions");

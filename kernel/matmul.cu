@@ -289,3 +289,24 @@ void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
 
     CUDA_CHECK(free_all());
 }
+
+// Device-pointer entry point: launches the same tiled GEMM kernel
+// but expects all pointers to already reside in device memory.
+// No host-device copies are performed. Caller manages allocation and lifetime.
+void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
+                       int M, int K, int N) {
+    if (M < 0 || K < 0 || N < 0) {
+        throw std::runtime_error(
+            "gpu_matmul_device expects non-negative dimensions");
+    }
+    if (M == 0 || K == 0 || N == 0) {
+        return; // nothing to compute
+    }
+
+    const dim3 block(BLOCK_X, BLOCK_Y);
+    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}

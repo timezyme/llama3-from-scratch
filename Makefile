@@ -87,3 +87,61 @@ $(BUILD_DIR)/test.o: tests/test.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_api.o: tests/test_api.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# ------------------------------------------------------------
+# Milestone 2-3 internal tests (CUDA required)
+
+.PHONY: tests_m2m3
+
+ifeq ($(CUDA_ENABLED),1)
+
+M2M3_KERNEL_OBJECTS := $(BUILD_DIR)/matmul.o \
+                      $(BUILD_DIR)/rmsnorm.o \
+                      $(BUILD_DIR)/rope.o \
+                      $(BUILD_DIR)/attention.o \
+                      $(BUILD_DIR)/swiglu.o \
+                      $(BUILD_DIR)/residual.o
+
+M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
+                     $(BUILD_DIR)/model_weights.o \
+                     $(BUILD_DIR)/inference.o \
+                     $(BUILD_DIR)/tokenizer_bpe.o \
+                     $(BUILD_DIR)/loader.o \
+                     $(M2M3_KERNEL_OBJECTS)
+
+tests_m2m3: $(BIN_DIR)/tests_m2m3
+
+$(BIN_DIR)/tests_m2m3: $(M2M3_TEST_OBJECTS) | $(BIN_DIR)
+	$(CXX) $(M2M3_TEST_OBJECTS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_m2m3.o: tests/test_m2m3.cpp | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/rmsnorm.o: kernel/rmsnorm.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/rope.o: kernel/rope.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/attention.o: kernel/attention.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/swiglu.o: kernel/swiglu.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/residual.o: kernel/residual.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+
+else
+
+tests_m2m3:
+	@echo "ERROR: tests_m2m3 requires CUDA (nvcc not found)"
+	@exit 1
+
+endif
