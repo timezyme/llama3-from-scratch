@@ -1,22 +1,26 @@
 # Llama 3 From Scratch
 
-From-scratch Llama 3 8B inference in C++17/CUDA. No ML framework dependencies at runtime.
+From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime.
 
-The pipeline covers tokenization (BPE with greedy merge), weight loading (BF16/FP16/FP32 via mmap), and matrix multiplication (double-buffered tiled GEMM on CUDA, with a CPU fallback). A Python toolchain handles downloading and converting the model weights offline.
+The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. A CPU matmul fallback builds when `nvcc` is unavailable. A Python toolchain downloads and converts the model weights offline.
 
 ## Guided tour
 
-There's a 14-step visual walkthrough of the codebase in [`docs/presentation/`](docs/presentation/index.html). Open `index.html` in a browser and use the arrow keys to navigate.
+A 14-step visual walkthrough of the codebase lives in [`docs/presentation/`](docs/presentation/index.html). Open `index.html` in a browser and use the arrow keys to navigate.
 
 ## Quick start
 
 ```bash
 # Build (CPU-only if nvcc is not found)
 make                    # release build → bin/llm
-make tests              # test binary → bin/tests
+make tests              # M1 test binary → bin/tests
+make tests_m2m3         # M2-3 test binary → bin/tests_m2m3 (CUDA required)
 
 # Run a test (requires model assets)
 ./bin/tests 1
+
+# Single-token inference (CUDA required)
+./bin/llm "The capital of France is"
 ```
 
 ## Prerequisites
@@ -31,7 +35,9 @@ make tests              # test binary → bin/tests
 ```bash
 make                    # release build (-O2) → bin/llm
 make BUILD=debug        # debug build (-g -O0)
-make tests              # test binary → bin/tests
+make tests              # M1 test binary → bin/tests
+make tests_m2m3         # M2-3 test binary → bin/tests_m2m3 (CUDA required)
+make run                # build and run bin/llm
 make clean              # remove build/ and bin/
 ```
 
@@ -160,16 +166,23 @@ cd ~/llama3
 export PATH=/usr/local/cuda/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-make clean && make tests
-./bin/tests 1    # tokenize "Hello world" → [128000, 9906, 1917]
+make clean && make && make tests && make tests_m2m3
 
-make
-./bin/llm
+# Run M1 tests
+for i in 1 2 3 4 5 6 7; do ./bin/tests $i; done
+
+# Run M2-3 tests
+for t in $(./bin/tests_m2m3 --list); do ./bin/tests_m2m3 $t; done
+
+# Single-token inference
+./bin/llm "The capital of France is"
 ```
 
 ## Test results
 
-All 7 tests pass on a GCP T4 (n1-standard-4).
+All 7 M1 tests and 27 M2-3 tests pass on a GCP T4 (n1-standard-4). CLI inference produces correct tokens validated against PyTorch.
+
+### Milestone 1 (tokenizer, embeddings, matmul)
 
 | Test | Description | Result |
 |------|-------------|--------|
@@ -181,33 +194,54 @@ All 7 tests pass on a GCP T4 (n1-standard-4).
 | `./bin/tests 6` | Matmul, seq_len=10 | PASSED |
 | `./bin/tests 7` | Matmul, seq_len=100 | PASSED |
 
+### Milestones 2-3 (CUDA kernels, full inference)
+
+27 tests covering RMSNorm, RoPE, attention (scale, causal mask, softmax, GQA), SwiGLU, residual add, single-layer forward pass, and full 32-layer inference. Run with:
+
+```bash
+./bin/tests_m2m3 --list   # list all test names
+./bin/tests_m2m3 <name>   # run a specific test
+```
+
 ## Project structure
 
 ```
-main.cpp                 # Entry point
-config.h                 # Constants (paths, dims, epsilon)
+main.cpp                 # CLI entry point (single-token inference)
+config.h                 # Llama 3 8B architecture constants
 include/
   prelude.h              # Common type aliases and STL imports
   tokenizer.h            # BPETokenizer interface
-  loader.h               # LlamaDumpLoader declarations
+  loader.h               # LlamaDumpLoader (binary dump reader)
   milifloat.h            # BF16/FP16 → FP32 converters
-  operator.cuh           # AbstractOperator base class
+  model_weights.h        # Per-layer and global weight management
+  inference.h            # Forward-pass entry points
+  operator.cuh           # AbstractOperator base class (scaffold)
 src/
-  tokenizer_bpe.cpp      # BPE tokenizer (encode/decode)
-  loader.cpp             # Weight loader (mmap, BF16→FP32)
+  tokenizer_bpe.cpp      # BPE tokenizer (encode/decode with special tokens)
+  loader.cpp             # Weight loader (280-byte header + BF16/FP16/FP32 payload)
+  model_weights.cpp      # Weight loading with transpose-at-load
+  inference.cu           # 32-layer forward pass with chat template
 kernel/
-  kernels.cuh            # CUDA kernel signatures
-  matmul.cu              # Tiled GEMM kernel (double-buffered, shared memory)
+  kernels.cuh            # Host-callable kernel entry points
+  matmul.cu              # Tiled GEMM (double-buffered shared memory, float4 loads)
   matmul_cpu.cpp         # CPU fallback for non-CUDA builds
+  rmsnorm.cu             # Row-wise RMSNorm with shared-memory reduction
+  rope.cu                # Rotary position embeddings (rotate_full convention)
+  attention.cu           # Scale, causal mask, numerically stable softmax
+  swiglu.cu              # SwiGLU activation (SiLU(gate) * up)
+  residual.cu            # In-place residual addition
 tests/
-  test.cpp               # Test harness (7 tests)
-  test_api.h             # TestAPI interface
+  test.cpp               # M1 test harness (7 tests, read-only)
+  test_api.h             # TestAPI interface (read-only)
   test_api.cpp           # TestAPI implementation (tokenize, embed, matmul)
+  test_m2m3.cpp          # M2-3 test harness (27 tests, CUDA required)
 tools/
   llama3_downloader.py   # Download weights from Hugging Face
-  dumper.py              # Safetensors → binary dump
+  dumper.py              # Safetensors → binary dump (280-byte header + payload)
+  gen_m2m3_fixtures.py   # Generate golden test fixtures via NumPy
   token_show.py          # Token inspection utility
 docs/
   presentation/          # Interactive guided tour of the codebase
+  learnings.md           # Project-specific knowledge and gotchas
   Milestone1-Report.pdf  # Project report
 ```
