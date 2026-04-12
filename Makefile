@@ -1,6 +1,6 @@
 # This is your make file
 # You may change it and we use it to build your code.
-# DO NOT CHANGE RECIPE FOR TEST RELATED TARGETS 
+# DO NOT CHANGE RECIPE FOR TEST RELATED TARGETS
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -pedantic -MMD -MP
 LDFLAGS :=
@@ -30,15 +30,30 @@ else
   CUDA_ENABLED := 0
 endif
 
+# Shared CUDA kernel and inference objects (used by both main binary and tests_m2m3)
+CUDA_KERNEL_OBJECTS :=
+MAIN_CUDA_OBJECTS :=
+
 ifeq ($(CUDA_ENABLED),1)
-  MATMUL_OBJECT := $(BUILD_DIR)/matmul.o
   CUDA_PATH ?= /usr/local/cuda
   LDFLAGS += -L$(CUDA_PATH)/lib64 -lcudart
+  CXXFLAGS += -DCUDA_ENABLED
+  NVCCFLAGS += -DCUDA_ENABLED
+  CUDA_KERNEL_OBJECTS := $(BUILD_DIR)/matmul.o \
+                         $(BUILD_DIR)/rmsnorm.o \
+                         $(BUILD_DIR)/rope.o \
+                         $(BUILD_DIR)/attention.o \
+                         $(BUILD_DIR)/swiglu.o \
+                         $(BUILD_DIR)/residual.o
+  MAIN_CUDA_OBJECTS := $(BUILD_DIR)/model_weights.o \
+                       $(BUILD_DIR)/inference.o \
+                       $(CUDA_KERNEL_OBJECTS)
+  OBJECTS += $(MAIN_CUDA_OBJECTS)
 else
   MATMUL_OBJECT := $(BUILD_DIR)/matmul_cpu.o
+  OBJECTS += $(MATMUL_OBJECT)
 endif
 
-OBJECTS += $(MATMUL_OBJECT)
 DEPS := $(OBJECTS:.o=.d)
 
 all: $(BIN_DIR)/$(TARGET)
@@ -53,6 +68,10 @@ $(BUILD_DIR)/loader.o: $(SRC_DIR)/loader.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/matmul_cpu.o: kernel/matmul_cpu.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/matmul.o: kernel/matmul.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR) $(BIN_DIR):
 	mkdir -p $@
@@ -75,7 +94,13 @@ run: all
 
 .PHONY: tests
 
-TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o $(BUILD_DIR)/loader.o $(MATMUL_OBJECT)
+ifeq ($(CUDA_ENABLED),1)
+  TEST_MATMUL := $(BUILD_DIR)/matmul.o
+else
+  TEST_MATMUL := $(BUILD_DIR)/matmul_cpu.o
+endif
+
+TEST_OBJECTS := $(BUILD_DIR)/test.o $(BUILD_DIR)/test_api.o $(BUILD_DIR)/tokenizer_bpe.o $(BUILD_DIR)/loader.o $(TEST_MATMUL)
 
 tests: $(BIN_DIR)/tests
 
@@ -95,12 +120,7 @@ $(BUILD_DIR)/test_api.o: tests/test_api.cpp | $(BUILD_DIR)
 
 ifeq ($(CUDA_ENABLED),1)
 
-M2M3_KERNEL_OBJECTS := $(BUILD_DIR)/matmul.o \
-                      $(BUILD_DIR)/rmsnorm.o \
-                      $(BUILD_DIR)/rope.o \
-                      $(BUILD_DIR)/attention.o \
-                      $(BUILD_DIR)/swiglu.o \
-                      $(BUILD_DIR)/residual.o
+M2M3_KERNEL_OBJECTS := $(CUDA_KERNEL_OBJECTS)
 
 M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
                      $(BUILD_DIR)/model_weights.o \
@@ -116,12 +136,6 @@ $(BIN_DIR)/tests_m2m3: $(M2M3_TEST_OBJECTS) | $(BIN_DIR)
 
 $(BUILD_DIR)/test_m2m3.o: tests/test_m2m3.cpp | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
-
-$(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/rmsnorm.o: kernel/rmsnorm.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
