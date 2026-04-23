@@ -1,12 +1,8 @@
 # Llama 3 From Scratch
 
-From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime.
+From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime. Built on the [CS265 MLSys starter project](https://github.com/qtwang/CS265-mlsys-project).
 
 The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. A CPU matmul fallback builds when `nvcc` is unavailable. A Python toolchain downloads and converts the model weights offline.
-
-## Guided tour
-
-A 14-step visual walkthrough of the codebase lives in [`docs/presentation/`](docs/presentation/index.html). Open `index.html` in a browser and use the arrow keys to navigate.
 
 ## Quick start
 
@@ -203,11 +199,23 @@ All 7 M1 tests and 27 M2-3 tests pass on a GCP T4 (n1-standard-4). CLI inference
 ./bin/tests_m2m3 <name>   # run a specific test
 ```
 
+## Numerical validation against the grading reference
+
+`reference.py` is the PyTorch forward pass the TAs use to grade this project (pulled from the upstream repo). `tools/verify_reference.py` runs both `reference.py` and the NumPy logic from `gen_m2m3_fixtures.py` on the real Llama-3 weights and compares per-operator outputs (RMSNorm, QKV, RoPE, attention, FFN, final hidden, logits, argmax). When they agree within tolerance, our CUDA kernels transitively match the grading reference.
+
+```bash
+python3 tools/verify_reference.py --prompt hello    # <BOS> Hello world         -> next token 0
+python3 tools/verify_reference.py --prompt medium   # <BOS> The capital of France is -> next token 12366
+```
+
+Both prompts agree with `reference.py` to a per-op max abs diff < 1e-5 in layer 0 and produce the same argmax token.
+
 ## Project structure
 
 ```
 main.cpp                 # CLI entry point (single-token inference)
 config.h                 # Llama 3 8B architecture constants
+reference.py             # PyTorch grading reference (used by TAs)
 include/
   prelude.h              # Common type aliases and STL imports
   tokenizer.h            # BPETokenizer interface
@@ -239,9 +247,8 @@ tools/
   llama3_downloader.py   # Download weights from Hugging Face
   dumper.py              # Safetensors → binary dump (280-byte header + payload)
   gen_m2m3_fixtures.py   # Generate golden test fixtures via NumPy
+  verify_reference.py    # Compare reference.py vs our NumPy logic on real weights
   token_show.py          # Token inspection utility
 docs/
-  presentation/          # Interactive guided tour of the codebase
-  learnings.md           # Project-specific knowledge and gotchas
   Milestone1-Report.pdf  # Project report
 ```
