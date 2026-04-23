@@ -17,6 +17,7 @@ gold/
 .cursor/
 .understand-anything/
 CLAUDE.md
+.claude.local.md
 AGENTS.md
 .mcp.json
 .env

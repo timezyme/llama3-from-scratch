@@ -116,6 +116,17 @@ static bool check_max_abs(const std::vector<float> &got,
 // Tests
 // -----------------------------------------------------------------------------
 
+// Test 1: tokenize "Hello world" and expect exactly [128000, 9906, 1917].
+//
+// A tokenizer converts text to integer IDs. For Llama 3:
+//   128000 = <|begin_of_text|>, the BOS marker. Must be prepended by
+//            tokenize(); BPE itself does not produce it.
+//   9906   = "Hello"
+//   1917   = " world" (leading space included -- Llama's BPE attaches
+//            whitespace to the following word, not the preceding one).
+//
+// Simplest test in the suite. No file I/O, no GPU, no floating point.
+// Integer equality or bust.
 bool test_1() {
     TestAPI api;
 
@@ -139,6 +150,16 @@ bool test_1() {
     return true;
 }
 
+// Test 2: tokenize a longer sentence (~25 words) and compare against a
+// saved fixture.
+//
+// Input starts "first try give yourself a break..." -- ordinary prose,
+// apostrophes, repeated words. Test 1 only checked two easy tokens;
+// this one exercises the merge loop on realistic input where ordering
+// and whitespace bugs actually surface.
+//
+// Still integer equality, still no tolerance. Expected IDs live in
+// tests/data/test2_tokenize.bin because the list is too long to hardcode.
 bool test_2() {
     char path[256];
     std::snprintf(path, sizeof(path), "%s/test2_tokenize.bin", DATA_DIR);
@@ -162,6 +183,19 @@ bool test_2() {
     return true;
 }
 
+// Test 3: look up embedding rows for a list of token IDs and compare
+// against saved values.
+//
+// An embedding is a row of 4096 floats associated with a token ID. Llama
+// 3's full table has 128,256 rows and ships on disk as BF16 (2 bytes per
+// float), totaling about 1 GB. The loader reads the BF16 bytes and expands
+// each value to FP32 before returning it.
+//
+// The fixture tests/data/test3_embedding.bin holds both the input IDs and
+// the expected FP32 values. Tolerance is 1e-2: if any output value differs
+// from its expected value by more than 0.01, the test fails. The slack
+// absorbs small bit-level differences between the Python reference that
+// generated the fixture and this C++ loader.
 bool test_3() {
     char path[256];
     std::snprintf(path, sizeof(path), "%s/test3_embedding.bin", DATA_DIR);
