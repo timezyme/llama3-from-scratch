@@ -21,7 +21,9 @@ AGENTS.md
 .mcp.json
 .env
 .venv/
+__pycache__/
+*.pyc
 
 docs/*
 !docs/Milestone1-Report.pdf
-!docs/presentation/
+docs/presentation/

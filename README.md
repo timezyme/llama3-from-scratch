@@ -1,6 +1,6 @@
 # Llama 3 From Scratch
 
-From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime.
+From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime. Built on the [CS265 MLSys starter project](https://github.com/qtwang/CS265-mlsys-project).
 
 The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. A CPU matmul fallback builds when `nvcc` is unavailable. A Python toolchain downloads and converts the model weights offline.
 
