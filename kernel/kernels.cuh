@@ -5,6 +5,8 @@
 
 #include "prelude.h"
 
+#include <cstdint>
+
 // CUDA kernel declarations — only visible when compiled by nvcc.
 #ifdef __CUDACC__
 __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
@@ -25,6 +27,13 @@ void gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N);
 // Exists to avoid redundant cudaMemcpy in multi-step pipelines (Part 2+).
 void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
                        int M, int K, int N);
+
+// Device-pointer entry point: C[M,N] = A[M,K] * B_bf16[K,N].
+// A and C are FP32 device pointers. B stores raw BF16 bits in device memory.
+// Accumulation stays FP32, matching a BF16-rounded FP32 reference weight.
+void gpu_matmul_device_bf16_weight(const float *d_A,
+                                   const uint16_t *d_B_bf16,
+                                   float *d_C, int M, int K, int N);
 
 // -----------------------------------------------------------------------
 // RMSNorm: output[r,c] = input[r,c] / RMS(row_r) * gamma[c]
