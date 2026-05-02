@@ -9,6 +9,7 @@ bin/
 build/
 assets/
 gold/
+.reports/
 
 .agent/
 .agents/
