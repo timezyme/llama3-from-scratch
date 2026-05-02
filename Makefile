@@ -5,7 +5,9 @@ CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -pedantic -MMD -MP
 LDFLAGS :=
 NVCC := nvcc
-NVCCFLAGS := -std=c++17 -O2
+ARCH ?= sm_75
+NVCCFLAGS ?= -std=c++17 -O2
+NVCCFLAGS += -arch=$(ARCH)
 BUILD ?= release
 
 ifeq ($(BUILD),debug)
@@ -47,6 +49,7 @@ ifeq ($(CUDA_ENABLED),1)
                          $(BUILD_DIR)/residual.o
   MAIN_CUDA_OBJECTS := $(BUILD_DIR)/model_weights.o \
                        $(BUILD_DIR)/inference.o \
+                       $(BUILD_DIR)/kv_cache.o \
                        $(CUDA_KERNEL_OBJECTS)
   OBJECTS += $(MAIN_CUDA_OBJECTS)
 else
@@ -72,6 +75,8 @@ $(BUILD_DIR)/matmul.o: kernel/matmul.cu | $(BUILD_DIR)
 $(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/kv_cache.o: $(SRC_DIR)/kv_cache.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR) $(BIN_DIR):
 	mkdir -p $@
@@ -125,6 +130,7 @@ M2M3_KERNEL_OBJECTS := $(CUDA_KERNEL_OBJECTS)
 M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
                      $(BUILD_DIR)/model_weights.o \
                      $(BUILD_DIR)/inference.o \
+                     $(BUILD_DIR)/kv_cache.o \
                      $(BUILD_DIR)/tokenizer_bpe.o \
                      $(BUILD_DIR)/loader.o \
                      $(M2M3_KERNEL_OBJECTS)

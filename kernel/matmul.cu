@@ -4,12 +4,13 @@
 // Each thread block computes a BM x BN tile of C. Each thread within
 // the block computes a TM x TN sub-tile using register-level accumulation.
 // Shared memory uses +1 padding to avoid bank conflicts.
-// Matrix B is loaded via float4 vectorized reads for coalesced global access.
+// Matrix B is loaded with vectorized reads for coalesced global access.
 
 #include "kernel/kernels.cuh"
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 
@@ -47,6 +48,19 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
     oss << "CUDA error at " << file << ":" << line << " for " << expr << ": "
         << cudaGetErrorString(err);
     throw std::runtime_error(oss.str());
+}
+
+__device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
+    return __uint_as_float(static_cast<unsigned int>(bits) << 16);
+}
+
+__device__ __forceinline__ void load_bf16_quad(float *dst,
+                                               const uint16_t *src) {
+    uint2 packed = *reinterpret_cast<const uint2 *>(src);
+    dst[0] = bf16_bits_to_float(static_cast<uint16_t>(packed.x & 0xffffu));
+    dst[1] = bf16_bits_to_float(static_cast<uint16_t>(packed.x >> 16));
+    dst[2] = bf16_bits_to_float(static_cast<uint16_t>(packed.y & 0xffffu));
+    dst[3] = bf16_bits_to_float(static_cast<uint16_t>(packed.y >> 16));
 }
 
 } // namespace
@@ -214,6 +228,141 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     }
 }
 
+// GEMM with FP32 activations and BF16-packed weights:
+// C[M,N] = A[M,K] * B_bf16[K,N].
+// This mirrors matmul_kernel's tiling so downstream code can swap only the
+// weight representation before moving to tensor-core kernels.
+__global__ void matmul_bf16_weight_kernel(const float *A,
+                                          const uint16_t *B_bf16,
+                                          float *C, int M, int K, int N) {
+    __shared__ float smA[2][BM][BK + 1];
+    __shared__ float smB[2][BK][BN + 1];
+
+    const int tid = threadIdx.y * BLOCK_X + threadIdx.x;
+    const int num_tiles = (K + BK - 1) / BK;
+
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TN; ++j)
+            acc[i][j] = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < SMA_LOADS_PER_THREAD; ++i) {
+        int elem = tid + i * NUM_THREADS;
+        int sr = elem / BK;
+        int sc = elem % BK;
+        int gr = blockIdx.y * BM + sr;
+        int gc = sc;
+        smA[0][sr][sc] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+    }
+
+    // Cooperatively load smB. Each thread reads two aligned uint2 chunks
+    // (8 BF16 values total) when possible; scalar fallback handles edge tiles.
+    #pragma unroll
+    for (int i = 0; i < SMB_F4_PER_THREAD; ++i) {
+        int f4 = tid + i * NUM_THREADS;
+        int sr = f4 / SMB_F4_PER_ROW;
+        int sc = (f4 % SMB_F4_PER_ROW) * 4;
+        int gr = sr;
+        int gc = blockIdx.x * BN + sc;
+        int idx = gr * N + gc;
+        if (gr < K && gc + 3 < N && (idx % 4 == 0)) {
+            load_bf16_quad(&smB[0][sr][sc], &B_bf16[idx]);
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int cj = gc + j;
+                smB[0][sr][sc + j] =
+                    (gr < K && cj < N)
+                        ? bf16_bits_to_float(B_bf16[gr * N + cj])
+                        : 0.0f;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    int cur = 0;
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int nxt = 1 - cur;
+
+        if (tile + 1 < num_tiles) {
+            int next_tile = tile + 1;
+
+            #pragma unroll
+            for (int i = 0; i < SMA_LOADS_PER_THREAD; ++i) {
+                int elem = tid + i * NUM_THREADS;
+                int sr = elem / BK;
+                int sc = elem % BK;
+                int gr = blockIdx.y * BM + sr;
+                int gc = next_tile * BK + sc;
+                smA[nxt][sr][sc] =
+                    (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+            }
+
+            #pragma unroll
+            for (int i = 0; i < SMB_F4_PER_THREAD; ++i) {
+                int f4 = tid + i * NUM_THREADS;
+                int sr = f4 / SMB_F4_PER_ROW;
+                int sc = (f4 % SMB_F4_PER_ROW) * 4;
+                int gr = next_tile * BK + sr;
+                int gc = blockIdx.x * BN + sc;
+                int idx = gr * N + gc;
+                if (gr < K && gc + 3 < N && (idx % 4 == 0)) {
+                    load_bf16_quad(&smB[nxt][sr][sc], &B_bf16[idx]);
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        int cj = gc + j;
+                        smB[nxt][sr][sc + j] =
+                            (gr < K && cj < N)
+                                ? bf16_bits_to_float(B_bf16[gr * N + cj])
+                                : 0.0f;
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                a_reg[tm] = smA[cur][threadIdx.y * TM + tm][k];
+
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn)
+                b_reg[tn] = smB[cur][k][threadIdx.x * TN + tn];
+
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn)
+                    acc[tm][tn] += a_reg[tm] * b_reg[tn];
+        }
+
+        __syncthreads();
+        cur = nxt;
+    }
+
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        int gr = blockIdx.y * BM + threadIdx.y * TM + tm;
+        if (gr < M) {
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) {
+                int gc = blockIdx.x * BN + threadIdx.x * TN + tn;
+                if (gc < N) {
+                    C[gr * N + gc] = acc[tm][tn];
+                }
+            }
+        }
+    }
+}
+
 // Host-side entry point: allocates device memory, copies A and B to GPU,
 // launches the kernel, copies C back, and frees device memory.
 // Exception-safe: device memory is freed on both success and error paths.
@@ -307,6 +456,25 @@ void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
     const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
     matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, K, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void gpu_matmul_device_bf16_weight(const float *d_A,
+                                   const uint16_t *d_B_bf16,
+                                   float *d_C, int M, int K, int N) {
+    if (M < 0 || K < 0 || N < 0) {
+        throw std::runtime_error(
+            "gpu_matmul_device_bf16_weight expects non-negative dimensions");
+    }
+    if (M == 0 || K == 0 || N == 0) {
+        return;
+    }
+
+    const dim3 block(BLOCK_X, BLOCK_Y);
+    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    matmul_bf16_weight_kernel<<<grid, block>>>(d_A, d_B_bf16, d_C, M, K, N);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -58,6 +59,19 @@ static void fill_deterministic(float *buf, int count, int seed) {
     for (int i = 0; i < count; ++i) {
         buf[i] = static_cast<float>((i + seed) % 13) * 0.1f - 0.6f;
     }
+}
+
+static uint16_t float_to_bf16_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+static float bf16_bits_to_float_host(uint16_t bits) {
+    uint32_t fp32_bits = static_cast<uint32_t>(bits) << 16;
+    float value = 0.0f;
+    std::memcpy(&value, &fp32_bits, sizeof(value));
+    return value;
 }
 
 // Compare two float buffers element-wise. Returns true if all match.
@@ -159,6 +173,79 @@ static int test_matmul_device_parity_realistic() {
         return FAIL;
     }
     std::printf("PASS matmul_device_parity_realistic\n");
+    return PASS;
+}
+
+static bool run_bf16_weight_matmul_case(int M, int K, int N,
+                                        const char *label) {
+    const int sA = M * K, sB = K * N, sC = M * N;
+
+    std::vector<float> A(sA), B(sB), B_bf16_as_float(sB);
+    std::vector<uint16_t> B_bf16(sB);
+    std::vector<float> C_reference(sC), C_bf16(sC);
+    fill_deterministic(A.data(), sA, 123 + M + N);
+    fill_deterministic(B.data(), sB, 211 + K);
+
+    for (int i = 0; i < sB; ++i) {
+        B_bf16[i] = float_to_bf16_bits(B[i]);
+        B_bf16_as_float[i] = bf16_bits_to_float_host(B_bf16[i]);
+    }
+
+    float *d_A = nullptr, *d_B_ref = nullptr, *d_C_ref = nullptr,
+          *d_C_bf16 = nullptr;
+    uint16_t *d_B_bf16 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_A, static_cast<size_t>(sA) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_B_ref, static_cast<size_t>(sB) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_B_bf16,
+                          static_cast<size_t>(sB) * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_C_ref, static_cast<size_t>(sC) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_C_bf16, static_cast<size_t>(sC) * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_A, A.data(), static_cast<size_t>(sA) * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_ref, B_bf16_as_float.data(),
+                          static_cast<size_t>(sB) * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_bf16, B_bf16.data(),
+                          static_cast<size_t>(sB) * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice));
+
+    gpu_matmul_device(d_A, d_B_ref, d_C_ref, M, K, N);
+    gpu_matmul_device_bf16_weight(d_A, d_B_bf16, d_C_bf16, M, K, N);
+
+    CUDA_CHECK(cudaMemcpy(C_reference.data(), d_C_ref,
+                          static_cast<size_t>(sC) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(C_bf16.data(), d_C_bf16,
+                          static_cast<size_t>(sC) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B_ref));
+    CUDA_CHECK(cudaFree(d_B_bf16));
+    CUDA_CHECK(cudaFree(d_C_ref));
+    CUDA_CHECK(cudaFree(d_C_bf16));
+
+    if (!compare(C_reference.data(), C_bf16.data(), sC, EPSILON)) {
+        std::printf("  case %s failed (M=%d K=%d N=%d)\n", label, M, K, N);
+        return false;
+    }
+    std::printf("  case %s passed (M=%d K=%d N=%d)\n", label, M, K, N);
+    return true;
+}
+
+// BF16-weight path must match the FP32 device matmul when the reference
+// weights are rounded to BF16 first.
+static int test_bf16_weight_matmul_parity() {
+    if (!run_bf16_weight_matmul_case(3, 4096, 1024, "model_kv_width")) {
+        std::printf("FAIL bf16_weight_matmul_parity\n");
+        return FAIL;
+    }
+    if (!run_bf16_weight_matmul_case(5, 17, 19, "ragged_edge_tile")) {
+        std::printf("FAIL bf16_weight_matmul_parity\n");
+        return FAIL;
+    }
+    std::printf("PASS bf16_weight_matmul_parity\n");
     return PASS;
 }
 
@@ -1825,6 +1912,7 @@ static std::map<std::string, TestFunc> build_registry() {
     // Phase 0
     r["matmul_device_parity_small"] = test_matmul_device_parity_small;
     r["matmul_device_parity_realistic"] = test_matmul_device_parity_realistic;
+    r["bf16_weight_matmul_parity"] = test_bf16_weight_matmul_parity;
 
     // Phase 1
     r["rmsnorm_manual"] = test_rmsnorm_manual;

@@ -15,16 +15,24 @@ gold/
 .serena/
 .claude/
 .cursor/
+.gemini/
 .understand-anything/
 CLAUDE.md
 .claude.local.md
 AGENTS.md
 .mcp.json
 .env
+.l4-config.env
 .venv/
 __pycache__/
 *.pyc
+skills-lock.json
 
 docs/*
+!docs/index.md
+!docs/requirements-implementation.md
 !docs/Milestone1-Report.pdf
 docs/presentation/
+docs/JOURNAL.md
+docs/todos/TODO.md
+docs/RUNBOOK-L4.md
