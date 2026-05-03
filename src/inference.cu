@@ -8,8 +8,9 @@
 //                          one K/V row to the cache, and attends over the
 //                          full cached prefix.
 
-#include "inference.h"
 #include "config.h"
+#include "device_weights.h"
+#include "inference.h"
 #include "instrument.h"
 #include "kernel/kernels.cuh"
 #include "kv_cache.h"
@@ -172,7 +173,8 @@ std::vector<float> compute_lm_head_logits(const float *lm_head,
 std::vector<float> forward_step(const float *h_input, int q_seq,
                                 ModelWeights &weights, KVCache &cache,
                                 const float *d_cos_full,
-                                const float *d_sin_full) {
+                                const float *d_sin_full,
+                                DeviceModelWeights *resident_weights) {
     Stopwatch sw_step(q_seq == 1 ? "step.decode" : "step.prefill");
     const int d = EMBEDDING_DIM;
     const int kv_dim = KVCache::kv_dim();
@@ -204,13 +206,15 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     CUDA_CHECK(cudaMalloc(&d_Xnorm, bytes_X));
     CUDA_CHECK(cudaMalloc(&d_Q, bytes_X));
     CUDA_CHECK(cudaMalloc(&d_gamma, d * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wq, (size_t)d * d * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wk, (size_t)d * kv_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wv, (size_t)d * kv_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wo, (size_t)d * d * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wgate, (size_t)d * FFN_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wup, (size_t)d * FFN_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_wdown, (size_t)FFN_DIM * d * sizeof(float)));
+    if (resident_weights == nullptr) {
+        CUDA_CHECK(cudaMalloc(&d_wq, (size_t)d * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wk, (size_t)d * kv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wv, (size_t)d * kv_dim * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wo, (size_t)d * d * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wgate, (size_t)d * FFN_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wup, (size_t)d * FFN_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_wdown, (size_t)FFN_DIM * d * sizeof(float)));
+    }
     CUDA_CHECK(cudaMalloc(&d_attn, bytes_X));
     CUDA_CHECK(cudaMalloc(&d_attn_out, bytes_X));
     CUDA_CHECK(cudaMalloc(&d_gate, bytes_ffn));
@@ -225,36 +229,39 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
 
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         Stopwatch sw_layer("layer.total");
-        const LayerWeights *lw_ptr = nullptr;
-        {
-            Stopwatch sw_load("layer.load_disk_to_host");
-            lw_ptr = &weights.load_layer(layer);
-        }
-        const LayerWeights &lw = *lw_ptr;
+        const LayerWeights *lw = nullptr;
+        const DeviceLayerWeights *resident_lw = nullptr;
 
-        {
+        if (resident_weights != nullptr) {
+            resident_lw = &resident_weights->load_layer(layer);
+        } else {
+            Stopwatch sw_load("layer.load_disk_to_host");
+            lw = &weights.load_layer(layer);
+        }
+
+        if (resident_weights == nullptr) {
             Stopwatch sw_h2d("layer.h2d_weights");
-            CUDA_CHECK(cudaMemcpy(d_gamma, lw.input_layernorm,
+            CUDA_CHECK(cudaMemcpy(d_gamma, lw->input_layernorm,
                                    d * sizeof(float), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wq, lw.q_proj,
+            CUDA_CHECK(cudaMemcpy(d_wq, lw->q_proj,
                                    (size_t)d * d * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wk, lw.k_proj,
+            CUDA_CHECK(cudaMemcpy(d_wk, lw->k_proj,
                                    (size_t)d * kv_dim * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wv, lw.v_proj,
+            CUDA_CHECK(cudaMemcpy(d_wv, lw->v_proj,
                                    (size_t)d * kv_dim * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wo, lw.o_proj,
+            CUDA_CHECK(cudaMemcpy(d_wo, lw->o_proj,
                                    (size_t)d * d * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wgate, lw.gate_proj,
+            CUDA_CHECK(cudaMemcpy(d_wgate, lw->gate_proj,
                                    (size_t)d * FFN_DIM * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wup, lw.up_proj,
+            CUDA_CHECK(cudaMemcpy(d_wup, lw->up_proj,
                                    (size_t)d * FFN_DIM * sizeof(float),
                                    cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_wdown, lw.down_proj,
+            CUDA_CHECK(cudaMemcpy(d_wdown, lw->down_proj,
                                    (size_t)FFN_DIM * d * sizeof(float),
                                    cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -262,12 +269,24 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
 
         {
             Stopwatch sw("layer.attn_pre");
-            gpu_rmsnorm(d_X, d_gamma, d_Xnorm, q_seq, d, RMS_NORM_EPSILON);
-            gpu_matmul_device(d_Xnorm, d_wq, d_Q, q_seq, d, d);
+            const float *input_norm =
+                resident_lw != nullptr ? resident_lw->input_layernorm : d_gamma;
+            gpu_rmsnorm(d_X, input_norm, d_Xnorm, q_seq, d,
+                        RMS_NORM_EPSILON);
             float *d_K_slot = cache.k_at(layer, len_before);
             float *d_V_slot = cache.v_at(layer, len_before);
-            gpu_matmul_device(d_Xnorm, d_wk, d_K_slot, q_seq, d, kv_dim);
-            gpu_matmul_device(d_Xnorm, d_wv, d_V_slot, q_seq, d, kv_dim);
+            if (resident_lw != nullptr) {
+                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->q_proj,
+                                              d_Q, q_seq, d, d);
+                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->k_proj,
+                                              d_K_slot, q_seq, d, kv_dim);
+                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->v_proj,
+                                              d_V_slot, q_seq, d, kv_dim);
+            } else {
+                gpu_matmul_device(d_Xnorm, d_wq, d_Q, q_seq, d, d);
+                gpu_matmul_device(d_Xnorm, d_wk, d_K_slot, q_seq, d, kv_dim);
+                gpu_matmul_device(d_Xnorm, d_wv, d_V_slot, q_seq, d, kv_dim);
+            }
             gpu_rope(d_Q, d_cos_step, d_sin_step, q_seq, NUM_HEADS, HEAD_DIM);
             gpu_rope(d_K_slot, d_cos_step, d_sin_step, q_seq, NUM_KV_HEADS,
                       HEAD_DIM);
@@ -296,20 +315,44 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             Stopwatch sw("layer.post_attn_and_ffn");
             CUDA_CHECK(cudaMemcpy(d_attn, attn_concat.data(), bytes_X,
                                    cudaMemcpyHostToDevice));
-            gpu_matmul_device(d_attn, d_wo, d_attn_out, q_seq, d, d);
+            if (resident_lw != nullptr) {
+                gpu_matmul_device_bf16_weight(d_attn, resident_lw->o_proj,
+                                              d_attn_out, q_seq, d, d);
+            } else {
+                gpu_matmul_device(d_attn, d_wo, d_attn_out, q_seq, d, d);
+            }
             gpu_residual_add(d_X, d_attn_out, q_seq * d);
-            CUDA_CHECK(cudaMemcpy(d_gamma, lw.post_attn_layernorm,
-                                   d * sizeof(float), cudaMemcpyHostToDevice));
-            gpu_rmsnorm(d_X, d_gamma, d_Xnorm, q_seq, d, RMS_NORM_EPSILON);
-            gpu_matmul_device(d_Xnorm, d_wgate, d_gate, q_seq, d, FFN_DIM);
-            gpu_matmul_device(d_Xnorm, d_wup, d_up, q_seq, d, FFN_DIM);
+            if (resident_lw == nullptr) {
+                CUDA_CHECK(cudaMemcpy(d_gamma, lw->post_attn_layernorm,
+                                      d * sizeof(float),
+                                      cudaMemcpyHostToDevice));
+            }
+            const float *post_attn_norm =
+                resident_lw != nullptr ? resident_lw->post_attn_layernorm
+                                       : d_gamma;
+            gpu_rmsnorm(d_X, post_attn_norm, d_Xnorm, q_seq, d,
+                        RMS_NORM_EPSILON);
+            if (resident_lw != nullptr) {
+                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->gate_proj,
+                                              d_gate, q_seq, d, FFN_DIM);
+                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->up_proj,
+                                              d_up, q_seq, d, FFN_DIM);
+            } else {
+                gpu_matmul_device(d_Xnorm, d_wgate, d_gate, q_seq, d, FFN_DIM);
+                gpu_matmul_device(d_Xnorm, d_wup, d_up, q_seq, d, FFN_DIM);
+            }
             gpu_swiglu(d_gate, d_up, d_gate, q_seq * FFN_DIM);
-            gpu_matmul_device(d_gate, d_wdown, d_ffn, q_seq, FFN_DIM, d);
+            if (resident_lw != nullptr) {
+                gpu_matmul_device_bf16_weight(d_gate, resident_lw->down_proj,
+                                              d_ffn, q_seq, FFN_DIM, d);
+            } else {
+                gpu_matmul_device(d_gate, d_wdown, d_ffn, q_seq, FFN_DIM, d);
+            }
             gpu_residual_add(d_X, d_ffn, q_seq * d);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        {
+        if (resident_weights == nullptr) {
             Stopwatch sw("layer.unload");
             weights.unload_layer(layer);
         }
@@ -357,9 +400,25 @@ void alloc_rope_tables(float **d_cos_out, float **d_sin_out) {
                            cudaMemcpyHostToDevice));
 }
 
-} // namespace
+void load_resident_layers(DeviceModelWeights *resident_weights) {
+    if (resident_weights == nullptr) {
+        return;
+    }
 
-int generate_next_token(ModelWeights &weights, const std::string &prompt) {
+    {
+        Stopwatch sw("weights.load_all_resident_bf16");
+        resident_weights->load_all_layers();
+    }
+
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    std::printf("  resident BF16 layer weights: %.2f GiB\n",
+                resident_weights->total_device_bytes() / gib);
+    probe_vram("after_resident_weights");
+}
+
+int generate_next_token_impl(ModelWeights &weights,
+                             DeviceModelWeights *resident_weights,
+                             const std::string &prompt) {
     Stopwatch::reset();
     probe_vram("startup");
 
@@ -377,6 +436,7 @@ int generate_next_token(ModelWeights &weights, const std::string &prompt) {
 
     KVCache cache(S_MAX);
     probe_vram("after_kvcache_alloc");
+    load_resident_layers(resident_weights);
 
     float *d_cos = nullptr, *d_sin = nullptr;
     alloc_rope_tables(&d_cos, &d_sin);
@@ -385,7 +445,7 @@ int generate_next_token(ModelWeights &weights, const std::string &prompt) {
     {
         Stopwatch sw_total("generate.total");
         auto last_hidden = forward_step(h_emb.get(), seq_len, weights, cache,
-                                         d_cos, d_sin);
+                                        d_cos, d_sin, resident_weights);
         {
             Stopwatch sw_lm("lm_head.cpu");
             auto logits = compute_lm_head_logits(weights.global().lm_head,
@@ -402,9 +462,10 @@ int generate_next_token(ModelWeights &weights, const std::string &prompt) {
     return argmax;
 }
 
-std::vector<int> generate_tokens(ModelWeights &weights,
-                                 const std::string &prompt,
-                                 int max_new_tokens) {
+std::vector<int> generate_tokens_impl(ModelWeights &weights,
+                                      DeviceModelWeights *resident_weights,
+                                      const std::string &prompt,
+                                      int max_new_tokens) {
     if (max_new_tokens <= 0) {
         return {};
     }
@@ -426,6 +487,7 @@ std::vector<int> generate_tokens(ModelWeights &weights,
     weights.load_global();
     KVCache cache(S_MAX);
     probe_vram("after_kvcache_alloc");
+    load_resident_layers(resident_weights);
 
     float *d_cos = nullptr, *d_sin = nullptr;
     alloc_rope_tables(&d_cos, &d_sin);
@@ -434,7 +496,7 @@ std::vector<int> generate_tokens(ModelWeights &weights,
     std::unique_ptr<float[]> h_emb_prefill(
         weights.get_embeddings(prompt_ids));
     auto last_hidden = forward_step(h_emb_prefill.get(), prompt_len, weights,
-                                     cache, d_cos, d_sin);
+                                    cache, d_cos, d_sin, resident_weights);
     auto logits = compute_lm_head_logits(weights.global().lm_head,
                                           last_hidden.data());
     int next_id = static_cast<int>(
@@ -451,7 +513,7 @@ std::vector<int> generate_tokens(ModelWeights &weights,
         std::vector<int> one = {next_id};
         std::unique_ptr<float[]> h_emb_one(weights.get_embeddings(one));
         last_hidden = forward_step(h_emb_one.get(), 1, weights, cache, d_cos,
-                                    d_sin);
+                                    d_sin, resident_weights);
         logits = compute_lm_head_logits(weights.global().lm_head,
                                          last_hidden.data());
         next_id = static_cast<int>(
@@ -465,6 +527,32 @@ std::vector<int> generate_tokens(ModelWeights &weights,
 
     Stopwatch::print_summary();
     return generated;
+}
+
+} // namespace
+
+int generate_next_token(ModelWeights &weights, const std::string &prompt) {
+    return generate_next_token_impl(weights, nullptr, prompt);
+}
+
+std::vector<int> generate_tokens(ModelWeights &weights,
+                                 const std::string &prompt,
+                                 int max_new_tokens) {
+    return generate_tokens_impl(weights, nullptr, prompt, max_new_tokens);
+}
+
+int generate_next_token_resident(ModelWeights &weights,
+                                 DeviceModelWeights &resident_weights,
+                                 const std::string &prompt) {
+    return generate_next_token_impl(weights, &resident_weights, prompt);
+}
+
+std::vector<int> generate_tokens_resident(ModelWeights &weights,
+                                          DeviceModelWeights &resident_weights,
+                                          const std::string &prompt,
+                                          int max_new_tokens) {
+    return generate_tokens_impl(weights, &resident_weights, prompt,
+                                max_new_tokens);
 }
 
 std::string decode_token(int token_id) {

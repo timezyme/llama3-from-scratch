@@ -97,6 +97,34 @@ size_t checked_mul(size_t a, size_t b, const char *context) {
     return a * b;
 }
 
+size_t tensor_element_count(size_t dim0, size_t dim1, bool is_2d) {
+    return is_2d ? checked_mul(dim0, dim1, "tensor element_count") : dim0;
+}
+
+void validate_shape(const TensorHeader &h, const string &dump_file,
+                    size_t dim0, size_t dim1, bool is_2d) {
+    if (is_2d) {
+        if (h.ndims != 2 || static_cast<size_t>(h.shape0) != dim0 ||
+            static_cast<size_t>(h.shape1) != dim1) {
+            throw runtime_error("2D tensor shape mismatch in " + dump_file);
+        }
+    } else if (h.ndims != 1 || static_cast<size_t>(h.shape0) != dim0) {
+        throw runtime_error("1D tensor shape mismatch in " + dump_file);
+    }
+}
+
+void validate_file_size(const std::vector<uint8_t> &blob,
+                        const TensorHeader &h, size_t count,
+                        const string &dump_file) {
+    const uint32_t elem_bytes = bytes_per_element(h.dtype_code);
+    const size_t payload_bytes = checked_mul(
+        count, static_cast<size_t>(elem_bytes), "payload bytes");
+    if (blob.size() != kHeaderSize + payload_bytes) {
+        throw runtime_error("file size does not match header metadata in " +
+                            dump_file);
+    }
+}
+
 // Parse the 280-byte header from the front of a dump file blob.
 // Extracts the tensor name (null-terminated within 256 bytes), dtype,
 // number of dimensions, and shape.
@@ -178,36 +206,43 @@ float_t *load_dense_tensor_checked(const string &dump_file, size_t dim0,
     std::vector<uint8_t> blob = read_file_binary(dump_file);
     TensorHeader h = parse_header(blob);
 
-    // Validate shape matches what the caller expects.
-    if (is_2d) {
-        if (h.ndims != 2 || static_cast<size_t>(h.shape0) != dim0 ||
-            static_cast<size_t>(h.shape1) != dim1) {
-            throw runtime_error("2D tensor shape mismatch in " + dump_file);
-        }
-    } else {
-        if (h.ndims != 1 || static_cast<size_t>(h.shape0) != dim0) {
-            throw runtime_error("1D tensor shape mismatch in " + dump_file);
-        }
-    }
-
-    // Verify file size = header + expected payload bytes.
-    const size_t count =
-        is_2d ? checked_mul(dim0, dim1, "tensor element_count") : dim0;
-    const uint32_t elem_bytes = bytes_per_element(h.dtype_code);
-    const size_t payload_bytes = checked_mul(count, static_cast<size_t>(elem_bytes),
-                                             "payload bytes");
-    if (blob.size() != kHeaderSize + payload_bytes) {
-        throw runtime_error("file size does not match header metadata in " +
-                            dump_file);
-    }
+    validate_shape(h, dump_file, dim0, dim1, is_2d);
+    const size_t count = tensor_element_count(dim0, dim1, is_2d);
+    validate_file_size(blob, h, count, dump_file);
 
     // Decode every element from its native dtype to FP32.
     const uint8_t *payload = blob.data() + kHeaderSize;
+    const uint32_t elem_bytes = bytes_per_element(h.dtype_code);
     std::unique_ptr<float_t[]> out(new float_t[count]);
     for (size_t i = 0; i < count; ++i) {
         out[i] = decode_value(payload + i * elem_bytes, h.dtype_code);
     }
     return out.release();
+}
+
+std::vector<uint16_t> load_bf16_raw_tensor_checked(const string &dump_file,
+                                                   size_t dim0, size_t dim1,
+                                                   bool is_2d) {
+    if (!is_little_endian_host()) {
+        throw runtime_error(
+            "unsupported big-endian host for raw BF16 dump payload");
+    }
+
+    std::vector<uint8_t> blob = read_file_binary(dump_file);
+    TensorHeader h = parse_header(blob);
+    validate_shape(h, dump_file, dim0, dim1, is_2d);
+    if (h.dtype_code != kDtypeBF16) {
+        throw runtime_error("raw BF16 loader expected BF16 dtype in " +
+                            dump_file);
+    }
+
+    const size_t count = tensor_element_count(dim0, dim1, is_2d);
+    validate_file_size(blob, h, count, dump_file);
+
+    std::vector<uint16_t> out(count);
+    const uint8_t *payload = blob.data() + kHeaderSize;
+    std::memcpy(out.data(), payload, count * sizeof(uint16_t));
+    return out;
 }
 } // namespace
 
@@ -329,4 +364,15 @@ float_t *LlamaDumpLoader::load_1d(const std::string &dump_file, size_t dim0) {
 float_t *LlamaDumpLoader::load_2d(const std::string &dump_file, size_t dim0,
                                   size_t dim1) {
     return load_dense_tensor_checked(dump_file, dim0, dim1, true);
+}
+
+std::vector<uint16_t>
+LlamaDumpLoader::load_1d_bf16_raw(const std::string &dump_file, size_t dim0) {
+    return load_bf16_raw_tensor_checked(dump_file, dim0, 0, false);
+}
+
+std::vector<uint16_t>
+LlamaDumpLoader::load_2d_bf16_raw(const std::string &dump_file, size_t dim0,
+                                  size_t dim1) {
+    return load_bf16_raw_tensor_checked(dump_file, dim0, dim1, true);
 }

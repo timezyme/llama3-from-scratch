@@ -48,6 +48,7 @@ ifeq ($(CUDA_ENABLED),1)
                          $(BUILD_DIR)/swiglu.o \
                          $(BUILD_DIR)/residual.o
   MAIN_CUDA_OBJECTS := $(BUILD_DIR)/model_weights.o \
+                       $(BUILD_DIR)/device_weights.o \
                        $(BUILD_DIR)/inference.o \
                        $(BUILD_DIR)/kv_cache.o \
                        $(CUDA_KERNEL_OBJECTS)
@@ -74,6 +75,8 @@ $(BUILD_DIR)/matmul.o: kernel/matmul.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/device_weights.o: $(SRC_DIR)/device_weights.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/kv_cache.o: $(SRC_DIR)/kv_cache.cu | $(BUILD_DIR)
@@ -129,6 +132,7 @@ M2M3_KERNEL_OBJECTS := $(CUDA_KERNEL_OBJECTS)
 
 M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
                      $(BUILD_DIR)/model_weights.o \
+                     $(BUILD_DIR)/device_weights.o \
                      $(BUILD_DIR)/inference.o \
                      $(BUILD_DIR)/kv_cache.o \
                      $(BUILD_DIR)/tokenizer_bpe.o \

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Recurring: push current source to L4, build, run M1 + M2-3, stop VM.
+# Recurring: push current source to L4, build, run a named test lane, stop VM.
 #
 # Reads config from `.l4-config.env`. Detects VM zone via gcloud (handles
 # zone changes after re-provisioning).
 #
 # Usage:
-#   ./tools/test_l4.sh             # full cycle, stop VM at end
-#   ./tools/test_l4.sh --quick     # skip full_forward_* and layer_streaming_smoke
+#   ./tools/test_l4.sh             # quick cycle, stop VM at end
+#   ./tools/test_l4.sh --perf      # TODO #1 KV-cache perf/audit lane
+#   ./tools/test_l4.sh --full      # final full regression gate
 #   ./tools/test_l4.sh --clean     # force make clean before build
 #   ./tools/test_l4.sh --no-stop   # leave VM running for follow-up work
 
@@ -16,14 +17,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 STOP_AT_END=1
-QUICK=0
+LANE="quick"
 FORCE_CLEAN=0
+PERF_TIMEOUT_SECONDS=300
 
 usage() {
     cat <<'USAGE'
-Usage: ./tools/test_l4.sh [--quick] [--clean] [--no-stop]
+Usage: ./tools/test_l4.sh [--unit|--quick|--perf|--full] [--clean] [--no-stop]
 
-  --quick     Run M1 plus fast M2-3 tests; skip full_forward_* and layer_streaming_smoke.
+  --unit      Build and run only the 7 M1 grading tests.
+  --quick     Build and run M1 plus fast M2-3 tests. Default lane.
+  --perf      Build and run the TODO #1 KV-cache performance/audit lane only.
+  --full      Build and run M1 plus every M2-3 test. Final gate only.
   --clean     Force make clean before building.
   --no-stop   Leave the VM running after the test cycle.
 USAGE
@@ -31,7 +36,15 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --quick) QUICK=1 ;;
+        --unit) LANE="unit" ;;
+        --quick) LANE="quick" ;;
+        --perf) LANE="perf" ;;
+        --full) LANE="full" ;;
+        --lane)
+            [[ $# -ge 2 ]] || { echo "ERROR: --lane requires unit|quick|perf|full" >&2; exit 1; }
+            LANE="$2"
+            shift
+            ;;
         --clean) FORCE_CLEAN=1 ;;
         --no-stop) STOP_AT_END=0 ;;
         -h|--help) usage; exit 0 ;;
@@ -39,6 +52,11 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+case "$LANE" in
+    unit|quick|perf|full) ;;
+    *) echo "ERROR: unknown lane: $LANE" >&2; usage >&2; exit 1 ;;
+esac
 
 [[ -f .l4-config.env ]] || { echo "ERROR: .l4-config.env missing. Run ./tools/provision_l4.sh first."; exit 1; }
 # shellcheck disable=SC1091
@@ -84,9 +102,7 @@ gcloud compute scp --zone="$ZONE" --recurse --scp-flag=-p \
     "$VM_NAME":~/CS265/ >/dev/null
 
 # ---- build + test on VM ----
-MODE="full"
-[[ $QUICK -eq 1 ]] && MODE="quick"
-echo "[test] build + run on $VM_NAME ($ZONE, mode=$MODE)..."
+echo "[test] build + run on $VM_NAME ($ZONE, lane=$LANE)..."
 EXIT=0
 gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="
 set -e
@@ -97,6 +113,7 @@ export CUDA_PATH=/usr/local/cuda-${CUDA_VER}
 JOBS=\$(nproc)
 echo \"[remote] nvcc=\$(command -v nvcc)\"
 echo \"[remote] jobs=\$JOBS arch=${ARCH} cuda_path=\$CUDA_PATH\"
+echo \"[remote] lane=${LANE}\"
 
 STAMP=build/.l4-clean-fingerprint
 if [ ${FORCE_CLEAN} -eq 1 ]; then
@@ -109,39 +126,115 @@ else
     echo '[remote] reusing existing build directory'
 fi
 
-make -j\"\$JOBS\" ARCH=${ARCH} CUDA_PATH=\"\$CUDA_PATH\" all tests tests_m2m3
+case '${LANE}' in
+    unit)
+        BUILD_TARGETS='all tests'
+        ;;
+    perf)
+        BUILD_TARGETS='all'
+        ;;
+    quick|full)
+        BUILD_TARGETS='all tests tests_m2m3'
+        ;;
+esac
+
+make -j\"\$JOBS\" ARCH=${ARCH} CUDA_PATH=\"\$CUDA_PATH\" \$BUILD_TARGETS
 mkdir -p build
 printf '%s\n' '${CLEAN_FINGERPRINT}' > \"\$STAMP\"
 
-echo
-echo '=== M1 (7 tests) ==='
-M1_FAIL=0
-for i in 1 2 3 4 5 6 7; do
-    OUT=\$(./bin/tests \$i 2>&1 | tail -1)
-    echo \"  test \$i: \$OUT\"
-    echo \"\$OUT\" | grep -q PASSED || M1_FAIL=\$((M1_FAIL+1))
-done
+run_m1() {
+    echo
+    echo '=== M1 (7 tests) ==='
+    M1_FAIL=0
+    for i in 1 2 3 4 5 6 7; do
+        OUT=\$(./bin/tests \$i 2>&1 | tail -1)
+        echo \"  test \$i: \$OUT\"
+        echo \"\$OUT\" | grep -q PASSED || M1_FAIL=\$((M1_FAIL+1))
+    done
+}
 
-echo
-if [ ${QUICK} -eq 1 ]; then
-    echo '=== M2-3 quick (skipping full_forward_* and layer_streaming_smoke) ==='
-    M2_TESTS=\$(./bin/tests_m2m3 --list | grep -Ev '^  (full_forward_|layer_streaming_smoke$)')
-else
-    echo '=== M2-3 (all tests) ==='
-    M2_TESTS=\$(./bin/tests_m2m3 --list)
-fi
+run_m2m3() {
+    local mode=\"\$1\"
+    echo
+    if [ \"\$mode\" = quick ]; then
+        echo '=== M2-3 quick (skipping full_forward_* and layer_streaming_smoke) ==='
+        M2_TESTS=\$(./bin/tests_m2m3 --list | grep -Ev '^  (full_forward_|layer_streaming_smoke$)')
+    else
+        echo '=== M2-3 full (all tests; final gate only) ==='
+        M2_TESTS=\$(./bin/tests_m2m3 --list)
+    fi
+    M2_FAIL=0
+    M2_COUNT=0
+    for t in \$M2_TESTS; do
+        M2_COUNT=\$((M2_COUNT+1))
+        OUT=\$(./bin/tests_m2m3 \$t 2>&1 | grep -E '^(PASS|FAIL)' | tail -1)
+        printf '  %-40s %s\n' \"\$t\" \"\$OUT\"
+        echo \"\$OUT\" | grep -q '^PASS' || M2_FAIL=\$((M2_FAIL+1))
+    done
+}
+
+run_kv_perf() {
+    echo
+    echo '=== PERF: TODO #1 KV cache resident 8-token audit ==='
+    LOG=build/l4-kv-cache-perf.log
+    rm -f \"\$LOG\"
+
+    set +e
+    /usr/bin/time -f '[perf] wall_seconds=%e' \
+        timeout ${PERF_TIMEOUT_SECONDS}s \
+        ./bin/llm --max-tokens 8 'The capital of France is' >\"\$LOG\" 2>&1
+    STATUS=\$?
+    set -e
+
+    tail -120 \"\$LOG\"
+    if [ \$STATUS -ne 0 ]; then
+        echo \"FAIL kv_cache_perf: command exited with status \$STATUS\"
+        exit \$STATUS
+    fi
+
+    FORBIDDEN=\$(grep -E '^[[:space:]]+(layer\\.load_disk_to_host|layer\\.h2d_weights|layer\\.unload)[[:space:]]' \"\$LOG\" || true)
+    if [ -n \"\$FORBIDDEN\" ]; then
+        echo
+        echo 'FAIL kv_cache_perf: resident decode hit forbidden streaming timers'
+        printf '%s\n' \"\$FORBIDDEN\"
+        exit 1
+    fi
+
+    echo
+    echo '=== PERF SUMMARY FIELDS ==='
+    grep -E '^[[:space:]]+(weights\\.load_all_resident_bf16|step\\.prefill|step\\.decode|generate\\.total|lm_head\\.cpu)[[:space:]]' \"\$LOG\" || true
+    echo 'PASS kv_cache_perf'
+}
+
+M1_FAIL=0
 M2_FAIL=0
 M2_COUNT=0
-for t in \$M2_TESTS; do
-    M2_COUNT=\$((M2_COUNT+1))
-    OUT=\$(./bin/tests_m2m3 \$t 2>&1 | grep -E '^(PASS|FAIL)' | tail -1)
-    printf '  %-40s %s\n' \"\$t\" \"\$OUT\"
-    echo \"\$OUT\" | grep -q '^PASS' || M2_FAIL=\$((M2_FAIL+1))
-done
 
-echo
-echo \"=== SUMMARY: M1 fail=\$M1_FAIL  M2-3 fail=\$M2_FAIL  M2-3 ran=\$M2_COUNT ===\"
-[ \$M1_FAIL -eq 0 ] && [ \$M2_FAIL -eq 0 ]
+case '${LANE}' in
+    unit)
+        run_m1
+        echo
+        echo \"=== SUMMARY: lane=unit  M1 fail=\$M1_FAIL ===\"
+        [ \$M1_FAIL -eq 0 ]
+        ;;
+    quick)
+        run_m1
+        run_m2m3 quick
+        echo
+        echo \"=== SUMMARY: lane=quick  M1 fail=\$M1_FAIL  M2-3 fail=\$M2_FAIL  M2-3 ran=\$M2_COUNT ===\"
+        [ \$M1_FAIL -eq 0 ] && [ \$M2_FAIL -eq 0 ]
+        ;;
+    perf)
+        run_kv_perf
+        ;;
+    full)
+        run_m1
+        run_m2m3 full
+        echo
+        echo \"=== SUMMARY: lane=full  M1 fail=\$M1_FAIL  M2-3 fail=\$M2_FAIL  M2-3 ran=\$M2_COUNT ===\"
+        [ \$M1_FAIL -eq 0 ] && [ \$M2_FAIL -eq 0 ]
+        ;;
+esac
 " || EXIT=$?
 
 # ---- stop VM (unless --no-stop) ----

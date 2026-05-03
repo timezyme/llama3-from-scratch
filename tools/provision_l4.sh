@@ -58,6 +58,7 @@ until nc -zw3 "$IP" 22 2>/dev/null; do sleep 5; done
 
 # ---- push tools/ + .env ----
 echo "[provision] pushing tools/, .env, and L4 config..."
+gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="mkdir -p ~/CS265" >/dev/null
 gcloud compute scp --zone="$ZONE" --recurse tools/ "$VM_NAME":~/CS265/ >/dev/null
 gcloud compute scp --zone="$ZONE" .env "$VM_NAME":~/CS265/.env >/dev/null
 gcloud compute scp --zone="$ZONE" .l4-config.env "$VM_NAME":~/CS265/.l4-config.env >/dev/null

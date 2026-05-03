@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "device_weights.h"
 #include "model_weights.h"
 
 #include <string>
@@ -22,6 +23,17 @@ int generate_next_token(ModelWeights &weights, const std::string &prompt);
 std::vector<int> generate_tokens(ModelWeights &weights,
                                  const std::string &prompt,
                                  int max_new_tokens);
+
+// Same generation APIs, but decoder layers are read from resident BF16 device
+// buffers instead of being streamed from disk for each step.
+int generate_next_token_resident(ModelWeights &weights,
+                                 DeviceModelWeights &resident_weights,
+                                 const std::string &prompt);
+
+std::vector<int> generate_tokens_resident(ModelWeights &weights,
+                                          DeviceModelWeights &resident_weights,
+                                          const std::string &prompt,
+                                          int max_new_tokens);
 
 // Decode a token ID back to text using the BPE tokenizer.
 std::string decode_token(int token_id);

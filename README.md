@@ -39,6 +39,21 @@ make run                # build and run bin/llm
 make clean              # remove build/ and bin/
 ```
 
+## L4 test lanes
+
+CUDA verification runs on the configured GCP L4 VM through `tools/test_l4.sh`.
+The default lane is intentionally quick; the full lane is a final gate.
+
+```bash
+./tools/test_l4.sh          # quick lane: M1 + fast M2-3
+./tools/test_l4.sh --unit   # M1 only
+./tools/test_l4.sh --perf   # TODO #1 KV-cache performance/audit
+./tools/test_l4.sh --full   # final full regression gate
+```
+
+The `--perf` lane runs the resident 8-token KV-cache path and fails if the log
+shows old per-layer streaming timers.
+
 ## GCP GPU VM setup
 
 You need a GPU to run the CUDA kernels. These instructions use a GCP spot instance with an NVIDIA T4 (~$0.16/hr).

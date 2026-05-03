@@ -46,6 +46,13 @@ class LlamaDumpLoader {
     // Load a 2D tensor (e.g. weight matrix) with shape validation.
     float_t *load_2d(const std::string &dump_file, size_t dim0, size_t dim1);
 
+    // Load BF16 payload bits without widening to FP32. These helpers still
+    // validate header dtype, rank, shape, and file size.
+    std::vector<uint16_t> load_1d_bf16_raw(const std::string &dump_file,
+                                           size_t dim0);
+    std::vector<uint16_t> load_2d_bf16_raw(const std::string &dump_file,
+                                           size_t dim0, size_t dim1);
+
   private:
     // Cached embedding blob and metadata to avoid re-reading the file.
     std::vector<uint8_t> embeddings_blob_;

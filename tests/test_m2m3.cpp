@@ -9,6 +9,8 @@
 // Usage: ./bin/tests_m2m3 <test_name>
 
 #include "config.h"
+#include "device_weights.h"
+#include "inference.h"
 #include "kernel/kernels.cuh"
 #include "model_weights.h"
 #include "tokenizer.h"
@@ -246,6 +248,136 @@ static int test_bf16_weight_matmul_parity() {
         return FAIL;
     }
     std::printf("PASS bf16_weight_matmul_parity\n");
+    return PASS;
+}
+
+// Proves: the loader can expose validated raw BF16 payloads without widening
+// them to FP32. This is the input seam for resident BF16 device weights.
+static int test_raw_bf16_loader_parity() {
+    LlamaDumpLoader loader(DumpFloatType::BF16);
+
+    const std::string norm_path =
+        DUMP_DIR + "/layer_00/model_layers_0_input_layernorm_weight.bin";
+    auto raw_norm = loader.load_1d_bf16_raw(norm_path, EMBEDDING_DIM);
+    std::unique_ptr<float[]> decoded_norm(
+        loader.load_1d(norm_path, EMBEDDING_DIM));
+    if (raw_norm.size() != static_cast<size_t>(EMBEDDING_DIM)) {
+        std::printf("FAIL raw_bf16_loader_parity: norm size mismatch\n");
+        return FAIL;
+    }
+
+    const int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    const std::string k_proj_path =
+        DUMP_DIR + "/layer_00/model_layers_0_self_attn_k_proj_weight.bin";
+    auto raw_k = loader.load_2d_bf16_raw(k_proj_path, kv_dim, EMBEDDING_DIM);
+    std::unique_ptr<float[]> decoded_k(
+        loader.load_2d(k_proj_path, kv_dim, EMBEDDING_DIM));
+    const size_t k_count = static_cast<size_t>(kv_dim) * EMBEDDING_DIM;
+    if (raw_k.size() != k_count) {
+        std::printf("FAIL raw_bf16_loader_parity: k_proj size mismatch\n");
+        return FAIL;
+    }
+
+    const size_t norm_indices[] = {0, 1, 127, 1024, EMBEDDING_DIM - 1};
+    for (size_t idx : norm_indices) {
+        float raw_value = bf16_bits_to_float_host(raw_norm[idx]);
+        if (raw_value != decoded_norm[idx]) {
+            std::printf("FAIL raw_bf16_loader_parity: norm[%zu] %.8f vs %.8f\n",
+                        idx, raw_value, decoded_norm[idx]);
+            return FAIL;
+        }
+    }
+
+    const size_t k_indices[] = {0,
+                                1,
+                                static_cast<size_t>(EMBEDDING_DIM - 1),
+                                static_cast<size_t>(EMBEDDING_DIM),
+                                k_count / 2,
+                                k_count - 1};
+    for (size_t idx : k_indices) {
+        float raw_value = bf16_bits_to_float_host(raw_k[idx]);
+        if (raw_value != decoded_k[idx]) {
+            std::printf("FAIL raw_bf16_loader_parity: k_proj[%zu] %.8f vs %.8f\n",
+                        idx, raw_value, decoded_k[idx]);
+            return FAIL;
+        }
+    }
+
+    std::printf("PASS raw_bf16_loader_parity\n");
+    return PASS;
+}
+
+// Proves: a layer can be loaded into persistent device buffers as transposed
+// BF16 projection weights plus FP32 norm weights.
+static int test_resident_layer0_weight_smoke() {
+    DeviceModelWeights resident(DUMP_DIR);
+    const DeviceLayerWeights &layer = resident.load_layer(0);
+
+    if (layer.k_proj == nullptr || layer.input_layernorm == nullptr ||
+        layer.device_bytes == 0 || !resident.layer_loaded(0)) {
+        std::printf("FAIL resident_layer0_weight_smoke: missing device buffer\n");
+        return FAIL;
+    }
+
+    const int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    const size_t k_count = static_cast<size_t>(EMBEDDING_DIM) * kv_dim;
+    std::vector<uint16_t> h_k(k_count);
+    CUDA_CHECK(cudaMemcpy(h_k.data(), layer.k_proj,
+                          k_count * sizeof(uint16_t),
+                          cudaMemcpyDeviceToHost));
+
+    LlamaDumpLoader loader(DumpFloatType::BF16);
+    const std::string k_proj_path =
+        DUMP_DIR + "/layer_00/model_layers_0_self_attn_k_proj_weight.bin";
+    auto raw_k = loader.load_2d_bf16_raw(k_proj_path, kv_dim, EMBEDDING_DIM);
+
+    const size_t samples[][2] = {{0, 0},
+                                 {1, 0},
+                                 {0, 1},
+                                 {127, 3},
+                                 {static_cast<size_t>(EMBEDDING_DIM - 1),
+                                  static_cast<size_t>(kv_dim - 1)}};
+    for (const auto &sample : samples) {
+        size_t in_col = sample[0];
+        size_t out_row = sample[1];
+        size_t transposed_idx = in_col * kv_dim + out_row;
+        size_t raw_idx = out_row * EMBEDDING_DIM + in_col;
+        if (h_k[transposed_idx] != raw_k[raw_idx]) {
+            std::printf("FAIL resident_layer0_weight_smoke: k[%zu,%zu] "
+                        "raw=0x%04x resident=0x%04x\n",
+                        in_col, out_row, raw_k[raw_idx],
+                        h_k[transposed_idx]);
+            return FAIL;
+        }
+    }
+
+    std::vector<float> h_norm(EMBEDDING_DIM);
+    CUDA_CHECK(cudaMemcpy(h_norm.data(), layer.input_layernorm,
+                          h_norm.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    std::unique_ptr<float[]> expected_norm(
+        loader.load_1d(DUMP_DIR +
+                           "/layer_00/model_layers_0_input_layernorm_weight.bin",
+                       EMBEDDING_DIM));
+    const size_t norm_indices[] = {0, 17, 1024, EMBEDDING_DIM - 1};
+    for (size_t idx : norm_indices) {
+        if (h_norm[idx] != expected_norm[idx]) {
+            std::printf("FAIL resident_layer0_weight_smoke: norm[%zu] %.8f "
+                        "vs %.8f\n",
+                        idx, h_norm[idx], expected_norm[idx]);
+            return FAIL;
+        }
+    }
+
+    size_t before_unload = resident.total_device_bytes();
+    resident.unload_layer(0);
+    if (before_unload == 0 || resident.total_device_bytes() != 0 ||
+        resident.layer_loaded(0)) {
+        std::printf("FAIL resident_layer0_weight_smoke: unload accounting\n");
+        return FAIL;
+    }
+
+    std::printf("PASS resident_layer0_weight_smoke\n");
     return PASS;
 }
 
@@ -1900,6 +2032,81 @@ static int test_full_forward_medium_prompt() {
     return PASS;
 }
 
+// Proves: the KV-cache generation API returns the same first token as the
+// single-token next-token path. This is intentionally a full-forward test
+// because both paths run the whole model before comparing API behavior.
+static int test_full_forward_kv_cache_one_token_parity() {
+    const std::string prompt = "The capital of France is";
+
+    ModelWeights single_step_weights(DUMP_DIR);
+    int expected = generate_next_token(single_step_weights, prompt);
+
+    ModelWeights cached_weights(DUMP_DIR);
+    auto generated = generate_tokens(cached_weights, prompt, 1);
+    if (generated.size() != 1) {
+        std::printf("FAIL full_forward_kv_cache_one_token_parity: expected 1 "
+                    "generated token, got %zu\n",
+                    generated.size());
+        return FAIL;
+    }
+
+    const int actual = generated[0];
+    std::printf("  prompt:             \"%s\"\n", prompt.c_str());
+    std::printf("  generate_next_token: %d\n", expected);
+    std::printf("  generate_tokens[0]:  %d\n", actual);
+
+    if (actual != expected) {
+        std::printf("FAIL full_forward_kv_cache_one_token_parity\n");
+        return FAIL;
+    }
+
+    std::printf("PASS full_forward_kv_cache_one_token_parity\n");
+    return PASS;
+}
+
+// Proves: the resident BF16 layer path preserves the first-token result from
+// the existing streaming path before we use it as the CLI default.
+static int test_full_forward_resident_one_token_parity() {
+    const std::string prompt = "The capital of France is";
+
+    int expected = -1;
+    {
+        ModelWeights streaming_weights(DUMP_DIR);
+        auto expected_tokens = generate_tokens(streaming_weights, prompt, 1);
+        if (expected_tokens.size() != 1) {
+            std::printf("FAIL full_forward_resident_one_token_parity: streaming "
+                        "path returned %zu tokens\n",
+                        expected_tokens.size());
+            return FAIL;
+        }
+        expected = expected_tokens[0];
+    }
+
+    ModelWeights resident_global_weights(DUMP_DIR);
+    DeviceModelWeights resident_layers(DUMP_DIR);
+    auto actual_tokens = generate_tokens_resident(resident_global_weights,
+                                                  resident_layers, prompt, 1);
+    if (actual_tokens.size() != 1) {
+        std::printf("FAIL full_forward_resident_one_token_parity: resident "
+                    "path returned %zu tokens\n",
+                    actual_tokens.size());
+        return FAIL;
+    }
+
+    const int actual = actual_tokens[0];
+    std::printf("  prompt:            \"%s\"\n", prompt.c_str());
+    std::printf("  streaming token:    %d\n", expected);
+    std::printf("  resident BF16 token:%d\n", actual);
+
+    if (actual != expected) {
+        std::printf("FAIL full_forward_resident_one_token_parity\n");
+        return FAIL;
+    }
+
+    std::printf("PASS full_forward_resident_one_token_parity\n");
+    return PASS;
+}
+
 // ---------------------------------------------------------------------------
 // Test Registry
 // ---------------------------------------------------------------------------
@@ -1913,6 +2120,8 @@ static std::map<std::string, TestFunc> build_registry() {
     r["matmul_device_parity_small"] = test_matmul_device_parity_small;
     r["matmul_device_parity_realistic"] = test_matmul_device_parity_realistic;
     r["bf16_weight_matmul_parity"] = test_bf16_weight_matmul_parity;
+    r["raw_bf16_loader_parity"] = test_raw_bf16_loader_parity;
+    r["resident_layer0_weight_smoke"] = test_resident_layer0_weight_smoke;
 
     // Phase 1
     r["rmsnorm_manual"] = test_rmsnorm_manual;
@@ -1950,6 +2159,10 @@ static std::map<std::string, TestFunc> build_registry() {
     r["weight_sharing_check"] = test_weight_sharing_check;
     r["layer_streaming_smoke"] = test_layer_streaming_smoke;
     r["full_forward_medium_prompt"] = test_full_forward_medium_prompt;
+    r["full_forward_kv_cache_one_token_parity"] =
+        test_full_forward_kv_cache_one_token_parity;
+    r["full_forward_resident_one_token_parity"] =
+        test_full_forward_resident_one_token_parity;
 
     return r;
 }

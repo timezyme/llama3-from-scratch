@@ -58,7 +58,6 @@ int main(int argc, char *argv[]) {
     std::printf("Max tokens: %d\n", max_tokens);
 
     ModelWeights weights(DUMP_DIR);
-
     if (max_tokens == 1) {
         int token_id = generate_next_token(weights, prompt);
         std::string decoded = decode_token(token_id);
@@ -67,7 +66,9 @@ int main(int argc, char *argv[]) {
         std::printf("Full output:     \"%s%s\"\n", prompt.c_str(),
                     decoded.c_str());
     } else {
-        auto ids = generate_tokens(weights, prompt, max_tokens);
+        DeviceModelWeights resident_weights(DUMP_DIR);
+        auto ids = generate_tokens_resident(weights, resident_weights, prompt,
+                                            max_tokens);
         std::string decoded;
         for (int id : ids) decoded += decode_token(id);
         std::printf("Generated %zu tokens:\n", ids.size());
