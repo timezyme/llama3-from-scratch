@@ -4,8 +4,6 @@ From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework depend
 
 The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. A CPU matmul fallback builds when `nvcc` is unavailable. A Python toolchain downloads and converts the model weights offline.
 
-For a plain-English tour of how the source code satisfies the assignment requirements, see [docs/requirements-implementation.md](docs/requirements-implementation.md).
-
 ## Notes for graders
 
 - **Required path uses FP32** (M1 grading tests via `bin/tests` 1..7, single-token inference). All 7 M1 tests pass on L4 (sm_89).
