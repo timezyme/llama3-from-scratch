@@ -78,6 +78,13 @@ class ModelWeights {
     // Caller owns the returned pointer (delete[]).
     float *get_embeddings(const std::vector<int> &token_ids);
 
+    // Batched embedding lookup: returns FP32 buffer [B, s_max, EMBEDDING_DIM].
+    // out_lens receives original per-batch lengths; pad rows are zeroed.
+    // Caller owns the returned pointer (delete[]).
+    float *get_embeddings_batched(
+        const std::vector<std::vector<int>> &batched_ids,
+        std::vector<int> &out_lens, int &out_smax);
+
     // Access the underlying loader for direct embedding table access.
     LlamaDumpLoader &loader() { return loader_; }
 

@@ -20,11 +20,15 @@ void cuda_check(cudaError_t err, const char *expr, const char *file, int line) {
 
 #define CUDA_CHECK(expr) cuda_check((expr), #expr, __FILE__, __LINE__)
 
-KVCache::KVCache(int max_seq_len) : max_len_(max_seq_len), len_(0) {
+KVCache::KVCache(int max_seq_len, int batch)
+    : max_len_(max_seq_len), batch_(batch), len_(0) {
     if (max_seq_len <= 0) {
         throw std::runtime_error("KVCache: max_seq_len must be positive");
     }
-    const size_t bytes = static_cast<size_t>(max_seq_len) * kv_dim() *
+    if (batch <= 0) {
+        throw std::runtime_error("KVCache: batch must be positive");
+    }
+    const size_t bytes = static_cast<size_t>(batch) * max_seq_len * kv_dim() *
                          sizeof(float);
     try {
         for (int i = 0; i < NUM_LAYERS; ++i) {

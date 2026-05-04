@@ -45,10 +45,11 @@ void gpu_rmsnorm(const float *d_input, const float *d_gamma,
 // -----------------------------------------------------------------------
 // RoPE: apply rotary position embeddings in-place.
 // x: flat projected tensor [seq_len, num_heads * head_dim], device memory.
-// cos_table, sin_table: precomputed [seq_len, head_dim/2], device memory.
+// For batched tensors, seq_len is B*q_seq and q_seq is the per-batch length.
+// cos_table, sin_table: precomputed [q_seq, head_dim/2], device memory.
 // Pairs dimension i with i + head_dim/2 (rotate_full convention).
 void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
-              int seq_len, int num_heads, int head_dim);
+              int seq_len, int num_heads, int head_dim, int q_seq = -1);
 
 // Precompute RoPE cos/sin tables on the host.
 // cos_out, sin_out: [seq_len, head_dim/2], host memory.

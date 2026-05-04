@@ -15,6 +15,7 @@ gold/
 .agents/
 .serena/
 .claude/
+.codex/
 .cursor/
 .gemini/
 .understand-anything/

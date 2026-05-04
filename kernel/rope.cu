@@ -32,27 +32,32 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
 // RoPE kernel: applies rotary embeddings in-place.
-// x: flat projected tensor [s, num_heads * head_dim], row-major.
-// cos_table, sin_table: precomputed [s, head_dim/2].
+// x: flat projected tensor [seq_len, num_heads * head_dim], row-major.
+// For batched tensors, seq_len is B*q_seq and RoPE positions wrap by q_seq.
+// Batched callers must stack rows as [batch, q_seq, num_heads, head_dim].
+// cos_table, sin_table: precomputed [q_seq, head_dim/2].
 // Each thread handles one (position, head, pair_index) triple.
 __global__ void rope_kernel(float *__restrict__ x,
                             const float *__restrict__ cos_table,
                             const float *__restrict__ sin_table,
-                            int seq_len, int num_heads, int head_dim) {
+                            int seq_len, int q_seq, int num_heads,
+                            int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_hd = head_dim / 2;
     int total = seq_len * num_heads * half_hd;
     if (idx >= total) return;
 
-    // Decompose flat index -> (position, head, pair_index)
+    // Decompose flat index -> (row, head, pair_index). The row addresses the
+    // flattened tensor; the RoPE position wraps inside each batch element.
     int pair_idx = idx % half_hd;
     int tmp = idx / half_hd;
     int head = tmp % num_heads;
-    int pos = tmp / num_heads;
+    int row = tmp / num_heads;
+    int pos = row % q_seq;
 
     // Row stride in the flat tensor
     int row_stride = num_heads * head_dim;
-    int base = pos * row_stride + head * head_dim;
+    int base = row * row_stride + head * head_dim;
 
     int i_first = base + pair_idx;
     int i_second = base + pair_idx + half_hd;
@@ -70,16 +75,20 @@ __global__ void rope_kernel(float *__restrict__ x,
 }
 
 void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
-              int seq_len, int num_heads, int head_dim) {
+              int seq_len, int num_heads, int head_dim, int q_seq) {
     int half_hd = head_dim / 2;
     int total = seq_len * num_heads * half_hd;
     if (total <= 0) return;
+    int actual_q_seq = (q_seq < 0) ? seq_len : q_seq;
+    if (actual_q_seq <= 0) {
+        throw std::runtime_error("gpu_rope: q_seq must be positive");
+    }
 
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
     rope_kernel<<<blocks, threads>>>(d_x, d_cos, d_sin,
-                                     seq_len, num_heads, head_dim);
+                                     seq_len, actual_q_seq, num_heads, head_dim);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }

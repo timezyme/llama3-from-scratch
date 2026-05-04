@@ -12,6 +12,7 @@
 #include "device_weights.h"
 #include "inference.h"
 #include "kernel/kernels.cuh"
+#include "kv_cache.h"
 #include "model_weights.h"
 #include "tokenizer.h"
 
@@ -24,6 +25,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -93,6 +95,14 @@ static bool compare(const float *a, const float *b, int count, float eps,
         }
     }
     return ok;
+}
+
+static float max_abs_diff(const float *a, const float *b, int count) {
+    float max_diff = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        max_diff = std::max(max_diff, std::fabs(a[i] - b[i]));
+    }
+    return max_diff;
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +1992,90 @@ static int test_layer_streaming_smoke() {
     return PASS;
 }
 
+static int test_embedding_batched_padding() {
+    ModelWeights weights(DUMP_DIR);
+    weights.load_global();
+
+    // Inference rejects mixed prompt lengths; this keeps the generic padding
+    // branch covered for direct embedding callers.
+    const std::vector<std::vector<int>> batched_ids = {
+        {128000, 882, 128009},
+        {128000, 882},
+    };
+
+    std::vector<int> lens;
+    int smax = 0;
+    std::unique_ptr<float[]> h_batched(
+        weights.get_embeddings_batched(batched_ids, lens, smax));
+
+    if (lens.size() != batched_ids.size() || lens[0] != 3 || lens[1] != 2 ||
+        smax != 3) {
+        std::printf("FAIL embedding_batched_padding: bad shape metadata "
+                    "(lens=%zu smax=%d)\n",
+                    lens.size(), smax);
+        return FAIL;
+    }
+
+    std::unique_ptr<float[]> h_single(weights.get_embeddings(batched_ids[0]));
+    const int d = EMBEDDING_DIM;
+    const int row_count = static_cast<int>(batched_ids[0].size());
+    if (!compare(h_batched.get(), h_single.get(), row_count * d, 0.0f)) {
+        std::printf("FAIL embedding_batched_padding: first batch rows changed\n");
+        return FAIL;
+    }
+
+    const float *pad_row = h_batched.get() + (static_cast<size_t>(1) * smax + 2) * d;
+    for (int i = 0; i < d; ++i) {
+        if (pad_row[i] != 0.0f) {
+            std::printf("FAIL embedding_batched_padding: pad[%d]=%.8f\n", i,
+                        pad_row[i]);
+            return FAIL;
+        }
+    }
+
+    std::printf("PASS embedding_batched_padding\n");
+    return PASS;
+}
+
+static bool expect_out_of_range(const char *label,
+                                const std::function<void()> &fn) {
+    try {
+        fn();
+    } catch (const std::out_of_range &) {
+        return true;
+    } catch (const std::exception &e) {
+        std::printf("FAIL kv_cache_bounds_checks: %s threw wrong error: %s\n",
+                    label, e.what());
+        return false;
+    }
+
+    std::printf("FAIL kv_cache_bounds_checks: %s did not throw\n", label);
+    return false;
+}
+
+static int test_kv_cache_bounds_checks() {
+    KVCache cache(2, 2);
+
+    bool ok = true;
+    ok = expect_out_of_range("k_batch layer",
+                             [&]() { (void)cache.k_batch(NUM_LAYERS, 0); }) &&
+         ok;
+    ok = expect_out_of_range("v_batch batch",
+                             [&]() { (void)cache.v_batch(0, 2); }) &&
+         ok;
+    ok = expect_out_of_range("k_at row",
+                             [&]() { (void)cache.k_at(0, 2, 0); }) &&
+         ok;
+    ok = expect_out_of_range("v_at batch",
+                             [&]() { (void)cache.v_at(0, 0, -1); }) &&
+         ok;
+
+    if (!ok) return FAIL;
+
+    std::printf("PASS kv_cache_bounds_checks\n");
+    return PASS;
+}
+
 // Full 32-layer forward pass with a longer prompt to test masking + RoPE at s>3.
 static int test_full_forward_medium_prompt() {
     // Tokenize "The capital of France is" via the C++ tokenizer
@@ -2107,6 +2201,90 @@ static int test_full_forward_resident_one_token_parity() {
     return PASS;
 }
 
+static bool assert_prompt_lengths_match(const std::string &pA,
+                                        const std::string &pB,
+                                        const char *test_name) {
+    BPETokenizer tok(TOKENIZER_PATH);
+    auto rA = tok.encode(pA);
+    auto rB = tok.encode(pB);
+    if (rA.size() != rB.size()) {
+        std::printf("FAIL %s: prompt token lengths diverged (A=%zu, B=%zu)\n",
+                    test_name, rA.size(), rB.size());
+        return false;
+    }
+    return true;
+}
+
+static bool same_tokens(const std::vector<int> &a, const std::vector<int> &b,
+                        const char *label) {
+    if (a == b) {
+        return true;
+    }
+    std::printf("  %s token mismatch: expected [", label);
+    for (size_t i = 0; i < a.size(); ++i) {
+        std::printf("%s%d", i ? ", " : "", a[i]);
+    }
+    std::printf("] got [");
+    for (size_t i = 0; i < b.size(); ++i) {
+        std::printf("%s%d", i ? ", " : "", b[i]);
+    }
+    std::printf("]\n");
+    return false;
+}
+
+static GenerateDebugResult run_debug_generation(
+    DeviceModelWeights &resident, const std::vector<std::string> &prompts,
+    int max_new_tokens) {
+    ModelWeights weights(DUMP_DIR);
+    return generate_tokens_resident_debug(weights, resident, prompts,
+                                          max_new_tokens);
+}
+
+static int test_batched_b2_distinct_parity() {
+    const std::string pA = "What is two plus two";
+    const std::string pB = "Why does the sun rise";
+    if (!assert_prompt_lengths_match(pA, pB, "batched_b2_distinct_parity")) {
+        return FAIL;
+    }
+
+    DeviceModelWeights resident(DUMP_DIR);
+    auto baseline_a = run_debug_generation(resident, {pA}, 1);
+    auto baseline_b = run_debug_generation(resident, {pB}, 1);
+    auto batched = run_debug_generation(resident, {pA, pB}, 1);
+
+    if (baseline_a.tokens.size() != 1 || baseline_b.tokens.size() != 1 ||
+        batched.tokens.size() != 2 || baseline_a.last_hidden.size() !=
+        static_cast<size_t>(EMBEDDING_DIM) || baseline_b.last_hidden.size() !=
+        static_cast<size_t>(EMBEDDING_DIM) || batched.last_hidden.size() !=
+        static_cast<size_t>(2 * EMBEDDING_DIM)) {
+        std::printf("FAIL batched_b2_distinct_parity: bad result shape\n");
+        return FAIL;
+    }
+
+    bool ok = same_tokens(baseline_a.tokens[0], batched.tokens[0], "batch 0") &&
+              same_tokens(baseline_b.tokens[0], batched.tokens[1], "batch 1");
+
+    const float diff_a = max_abs_diff(baseline_a.last_hidden.data(),
+                                      batched.last_hidden.data(),
+                                      EMBEDDING_DIM);
+    const float diff_b = max_abs_diff(
+        baseline_b.last_hidden.data(),
+        batched.last_hidden.data() + EMBEDDING_DIM, EMBEDDING_DIM);
+    std::printf("  hidden max abs diff: batch0=%.8f batch1=%.8f\n", diff_a,
+                diff_b);
+    if (diff_a >= 1e-3f || diff_b >= 1e-3f) {
+        ok = false;
+    }
+
+    if (!ok) {
+        std::printf("FAIL batched_b2_distinct_parity\n");
+        return FAIL;
+    }
+
+    std::printf("PASS batched_b2_distinct_parity\n");
+    return PASS;
+}
+
 // ---------------------------------------------------------------------------
 // Test Registry
 // ---------------------------------------------------------------------------
@@ -2158,11 +2336,14 @@ static std::map<std::string, TestFunc> build_registry() {
     r["lm_head_last_token_only"] = test_lm_head_last_token_only;
     r["weight_sharing_check"] = test_weight_sharing_check;
     r["layer_streaming_smoke"] = test_layer_streaming_smoke;
+    r["embedding_batched_padding"] = test_embedding_batched_padding;
+    r["kv_cache_bounds_checks"] = test_kv_cache_bounds_checks;
     r["full_forward_medium_prompt"] = test_full_forward_medium_prompt;
     r["full_forward_kv_cache_one_token_parity"] =
         test_full_forward_kv_cache_one_token_parity;
     r["full_forward_resident_one_token_parity"] =
         test_full_forward_resident_one_token_parity;
+    r["batched_b2_distinct_parity"] = test_batched_b2_distinct_parity;
 
     return r;
 }

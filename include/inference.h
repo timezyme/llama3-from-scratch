@@ -35,5 +35,18 @@ std::vector<int> generate_tokens_resident(ModelWeights &weights,
                                           const std::string &prompt,
                                           int max_new_tokens);
 
+std::vector<std::vector<int>> generate_tokens_resident(
+    ModelWeights &weights, DeviceModelWeights &resident_weights,
+    const std::vector<std::string> &prompts, int max_new_tokens);
+
+struct GenerateDebugResult {
+    std::vector<std::vector<int>> tokens;
+    std::vector<float> last_hidden;
+};
+
+GenerateDebugResult generate_tokens_resident_debug(
+    ModelWeights &weights, DeviceModelWeights &resident_weights,
+    const std::vector<std::string> &prompts, int max_new_tokens);
+
 // Decode a token ID back to text using the BPE tokenizer.
 std::string decode_token(int token_id);

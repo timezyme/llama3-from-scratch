@@ -5,6 +5,8 @@
 
 #include "model_weights.h"
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -43,6 +45,41 @@ void ModelWeights::load_global() {
 
 float *ModelWeights::get_embeddings(const std::vector<int> &token_ids) {
     return loader_.get_embeddings(token_ids);
+}
+
+float *ModelWeights::get_embeddings_batched(
+    const std::vector<std::vector<int>> &batched_ids,
+    std::vector<int> &out_lens, int &out_smax) {
+    if (batched_ids.empty()) {
+        throw std::runtime_error("get_embeddings_batched: empty batch");
+    }
+
+    out_lens.clear();
+    out_lens.reserve(batched_ids.size());
+    out_smax = 0;
+    for (const auto &ids : batched_ids) {
+        const int len = static_cast<int>(ids.size());
+        if (len <= 0) {
+            throw std::runtime_error(
+                "get_embeddings_batched: empty token sequence");
+        }
+        out_lens.push_back(len);
+        out_smax = std::max(out_smax, len);
+    }
+
+    const size_t batch = batched_ids.size();
+    const size_t row_width = static_cast<size_t>(EMBEDDING_DIM);
+    const size_t total = batch * out_smax * row_width;
+    std::unique_ptr<float[]> stacked(new float[total]());
+
+    for (size_t b = 0; b < batch; ++b) {
+        std::unique_ptr<float[]> single(loader_.get_embeddings(batched_ids[b]));
+        const size_t rows = batched_ids[b].size();
+        float *dst = stacked.get() + (b * out_smax) * row_width;
+        std::memcpy(dst, single.get(), rows * row_width * sizeof(float));
+    }
+
+    return stacked.release();
 }
 
 const LayerWeights &ModelWeights::load_layer(int layer_idx) {

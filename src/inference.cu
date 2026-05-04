@@ -166,31 +166,41 @@ std::vector<float> compute_lm_head_logits(const float *lm_head,
 }
 
 // Run one forward step over `q_seq` new tokens, advancing the cache.
-// h_input:    [q_seq, EMBEDDING_DIM] embeddings (host).
+// h_input:    [batch, q_seq, EMBEDDING_DIM] embeddings (host).
 // d_cos_full: [S_MAX, HEAD_DIM/2] (device), full RoPE cos table.
 // d_sin_full: [S_MAX, HEAD_DIM/2] (device), full RoPE sin table.
-// Returns the final-RMSNormed last-token hidden state (size EMBEDDING_DIM).
+// Returns final-RMSNormed last-token hidden states [batch, EMBEDDING_DIM].
 std::vector<float> forward_step(const float *h_input, int q_seq,
                                 ModelWeights &weights, KVCache &cache,
                                 const float *d_cos_full,
                                 const float *d_sin_full,
-                                DeviceModelWeights *resident_weights) {
+                                DeviceModelWeights *resident_weights,
+                                int batch = 1) {
     Stopwatch sw_step(q_seq == 1 ? "step.decode" : "step.prefill");
     const int d = EMBEDDING_DIM;
     const int kv_dim = KVCache::kv_dim();
     const int half_hd = HEAD_DIM / 2;
+    const int rows = batch * q_seq;
 
     const int len_before = cache.len();
     const int kv_seq = len_before + q_seq;
 
+    if (q_seq <= 0) {
+        throw std::runtime_error("forward_step: q_seq must be positive");
+    }
+    if (batch <= 0 || batch > cache.batch()) {
+        throw std::runtime_error("forward_step: invalid batch size");
+    }
     if (kv_seq > cache.max_len()) {
         throw std::runtime_error("forward_step: kv_seq exceeds cache capacity");
     }
 
-    const size_t bytes_X = static_cast<size_t>(q_seq) * d * sizeof(float);
+    const size_t bytes_X = static_cast<size_t>(rows) * d * sizeof(float);
+    const size_t bytes_X_one_batch =
+        static_cast<size_t>(q_seq) * d * sizeof(float);
     const size_t bytes_Xkv_full = static_cast<size_t>(kv_seq) * kv_dim *
                                    sizeof(float);
-    const size_t bytes_ffn = static_cast<size_t>(q_seq) * FFN_DIM *
+    const size_t bytes_ffn = static_cast<size_t>(rows) * FFN_DIM *
                               sizeof(float);
 
     // Persistent device buffers for this step (sized to q_seq).
@@ -271,44 +281,71 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             Stopwatch sw("layer.attn_pre");
             const float *input_norm =
                 resident_lw != nullptr ? resident_lw->input_layernorm : d_gamma;
-            gpu_rmsnorm(d_X, input_norm, d_Xnorm, q_seq, d,
+            gpu_rmsnorm(d_X, input_norm, d_Xnorm, rows, d,
                         RMS_NORM_EPSILON);
-            float *d_K_slot = cache.k_at(layer, len_before);
-            float *d_V_slot = cache.v_at(layer, len_before);
+            // Q is row-stacked across the batch, but K/V must land in
+            // contiguous [batch, s_max, kv_dim] cache slices. The per-batch
+            // K/V launches are a deliberate v1 layout tradeoff.
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->q_proj,
-                                              d_Q, q_seq, d, d);
-                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->k_proj,
-                                              d_K_slot, q_seq, d, kv_dim);
-                gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->v_proj,
-                                              d_V_slot, q_seq, d, kv_dim);
+                                              d_Q, rows, d, d);
+                for (int b = 0; b < batch; ++b) {
+                    const float *d_Xnorm_b =
+                        d_Xnorm + static_cast<size_t>(b) * q_seq * d;
+                    gpu_matmul_device_bf16_weight(
+                        d_Xnorm_b, resident_lw->k_proj,
+                        cache.k_at(layer, len_before, b), q_seq, d, kv_dim);
+                    gpu_matmul_device_bf16_weight(
+                        d_Xnorm_b, resident_lw->v_proj,
+                        cache.v_at(layer, len_before, b), q_seq, d, kv_dim);
+                }
             } else {
-                gpu_matmul_device(d_Xnorm, d_wq, d_Q, q_seq, d, d);
-                gpu_matmul_device(d_Xnorm, d_wk, d_K_slot, q_seq, d, kv_dim);
-                gpu_matmul_device(d_Xnorm, d_wv, d_V_slot, q_seq, d, kv_dim);
+                gpu_matmul_device(d_Xnorm, d_wq, d_Q, rows, d, d);
+                for (int b = 0; b < batch; ++b) {
+                    const float *d_Xnorm_b =
+                        d_Xnorm + static_cast<size_t>(b) * q_seq * d;
+                    gpu_matmul_device(d_Xnorm_b, d_wk,
+                                      cache.k_at(layer, len_before, b),
+                                      q_seq, d, kv_dim);
+                    gpu_matmul_device(d_Xnorm_b, d_wv,
+                                      cache.v_at(layer, len_before, b),
+                                      q_seq, d, kv_dim);
+                }
             }
-            gpu_rope(d_Q, d_cos_step, d_sin_step, q_seq, NUM_HEADS, HEAD_DIM);
-            gpu_rope(d_K_slot, d_cos_step, d_sin_step, q_seq, NUM_KV_HEADS,
-                      HEAD_DIM);
+            gpu_rope(d_Q, d_cos_step, d_sin_step, rows, NUM_HEADS, HEAD_DIM,
+                     q_seq);
+            for (int b = 0; b < batch; ++b) {
+                gpu_rope(cache.k_at(layer, len_before, b), d_cos_step,
+                         d_sin_step, q_seq, NUM_KV_HEADS, HEAD_DIM, q_seq);
+            }
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // Copy Q (q_seq rows) and full cached K/V (kv_seq rows) to host for the
         // host-orchestrated per-head attention loop. (See TODO #8: move this on-device.)
-        std::vector<float> h_Q(q_seq * d);
-        std::vector<float> h_K(kv_seq * kv_dim);
-        std::vector<float> h_V(kv_seq * kv_dim);
-        CUDA_CHECK(cudaMemcpy(h_Q.data(), d_Q, bytes_X,
-                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_K.data(), cache.k(layer), bytes_Xkv_full,
-                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_V.data(), cache.v(layer), bytes_Xkv_full,
-                               cudaMemcpyDeviceToHost));
-
-        std::vector<float> attn_concat((size_t)q_seq * d, 0.0f);
+        // With B>1 this sequential loop multiplies the transfer and reshape cost by B.
+        std::vector<float> attn_concat(static_cast<size_t>(rows) * d, 0.0f);
         {
             Stopwatch sw("layer.attn_heads");
-            run_attention_heads(h_Q, h_K, h_V, attn_concat, q_seq, kv_seq);
+            for (int b = 0; b < batch; ++b) {
+                std::vector<float> h_Q(q_seq * d);
+                std::vector<float> h_K(kv_seq * kv_dim);
+                std::vector<float> h_V(kv_seq * kv_dim);
+                CUDA_CHECK(cudaMemcpy(
+                    h_Q.data(), d_Q + static_cast<size_t>(b) * q_seq * d,
+                    bytes_X_one_batch, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_K.data(), cache.k_batch(layer, b),
+                                      bytes_Xkv_full, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_V.data(), cache.v_batch(layer, b),
+                                      bytes_Xkv_full, cudaMemcpyDeviceToHost));
+
+                std::vector<float> attn_one(static_cast<size_t>(q_seq) * d,
+                                            0.0f);
+                run_attention_heads(h_Q, h_K, h_V, attn_one, q_seq, kv_seq);
+                std::copy(attn_one.begin(), attn_one.end(),
+                          attn_concat.begin() +
+                              static_cast<size_t>(b) * q_seq * d);
+            }
         }
 
         {
@@ -317,11 +354,11 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
                                    cudaMemcpyHostToDevice));
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_attn, resident_lw->o_proj,
-                                              d_attn_out, q_seq, d, d);
+                                              d_attn_out, rows, d, d);
             } else {
-                gpu_matmul_device(d_attn, d_wo, d_attn_out, q_seq, d, d);
+                gpu_matmul_device(d_attn, d_wo, d_attn_out, rows, d, d);
             }
-            gpu_residual_add(d_X, d_attn_out, q_seq * d);
+            gpu_residual_add(d_X, d_attn_out, rows * d);
             if (resident_lw == nullptr) {
                 CUDA_CHECK(cudaMemcpy(d_gamma, lw->post_attn_layernorm,
                                       d * sizeof(float),
@@ -330,25 +367,25 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             const float *post_attn_norm =
                 resident_lw != nullptr ? resident_lw->post_attn_layernorm
                                        : d_gamma;
-            gpu_rmsnorm(d_X, post_attn_norm, d_Xnorm, q_seq, d,
+            gpu_rmsnorm(d_X, post_attn_norm, d_Xnorm, rows, d,
                         RMS_NORM_EPSILON);
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->gate_proj,
-                                              d_gate, q_seq, d, FFN_DIM);
+                                              d_gate, rows, d, FFN_DIM);
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->up_proj,
-                                              d_up, q_seq, d, FFN_DIM);
+                                              d_up, rows, d, FFN_DIM);
             } else {
-                gpu_matmul_device(d_Xnorm, d_wgate, d_gate, q_seq, d, FFN_DIM);
-                gpu_matmul_device(d_Xnorm, d_wup, d_up, q_seq, d, FFN_DIM);
+                gpu_matmul_device(d_Xnorm, d_wgate, d_gate, rows, d, FFN_DIM);
+                gpu_matmul_device(d_Xnorm, d_wup, d_up, rows, d, FFN_DIM);
             }
-            gpu_swiglu(d_gate, d_up, d_gate, q_seq * FFN_DIM);
+            gpu_swiglu(d_gate, d_up, d_gate, rows * FFN_DIM);
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_gate, resident_lw->down_proj,
-                                              d_ffn, q_seq, FFN_DIM, d);
+                                              d_ffn, rows, FFN_DIM, d);
             } else {
-                gpu_matmul_device(d_gate, d_wdown, d_ffn, q_seq, FFN_DIM, d);
+                gpu_matmul_device(d_gate, d_wdown, d_ffn, rows, FFN_DIM, d);
             }
-            gpu_residual_add(d_X, d_ffn, q_seq * d);
+            gpu_residual_add(d_X, d_ffn, rows * d);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
@@ -364,13 +401,17 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     // Final RMSNorm.
     CUDA_CHECK(cudaMemcpy(d_gamma, weights.global().final_norm,
                            d * sizeof(float), cudaMemcpyHostToDevice));
-    gpu_rmsnorm(d_X, d_gamma, d_Xnorm, q_seq, d, RMS_NORM_EPSILON);
+    gpu_rmsnorm(d_X, d_gamma, d_Xnorm, rows, d, RMS_NORM_EPSILON);
 
-    // Extract last row to host.
-    std::vector<float> last_hidden(d);
-    const size_t last_row_offset = (size_t)(q_seq - 1) * d;
-    CUDA_CHECK(cudaMemcpy(last_hidden.data(), d_Xnorm + last_row_offset,
-                           d * sizeof(float), cudaMemcpyDeviceToHost));
+    // Extract each batch element's last row to host.
+    std::vector<float> last_hidden(static_cast<size_t>(batch) * d);
+    for (int b = 0; b < batch; ++b) {
+        const size_t last_row_offset =
+            (static_cast<size_t>(b) * q_seq + (q_seq - 1)) * d;
+        CUDA_CHECK(cudaMemcpy(last_hidden.data() + static_cast<size_t>(b) * d,
+                              d_Xnorm + last_row_offset, d * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    }
 
     cudaFree(d_X); cudaFree(d_Xnorm); cudaFree(d_Q);
     cudaFree(d_gamma);
@@ -414,6 +455,135 @@ void load_resident_layers(DeviceModelWeights *resident_weights) {
     std::printf("  resident BF16 layer weights: %.2f GiB\n",
                 resident_weights->total_device_bytes() / gib);
     probe_vram("after_resident_weights");
+}
+
+int validate_equal_lengths(const std::vector<std::vector<int>> &batched_ids,
+                           const char *context) {
+    if (batched_ids.empty()) {
+        throw std::runtime_error(std::string(context) + ": empty batch");
+    }
+    const int s = static_cast<int>(batched_ids[0].size());
+    for (size_t b = 1; b < batched_ids.size(); ++b) {
+        if (static_cast<int>(batched_ids[b].size()) != s) {
+            throw std::runtime_error(
+                "batched inference requires equal tokenized prompt lengths "
+                "(mixed-length batching is out of scope for TODO #2)");
+        }
+    }
+    return s;
+}
+
+GenerateDebugResult generate_tokens_resident_batched_impl(
+    ModelWeights &weights, DeviceModelWeights &resident_weights,
+    const std::vector<std::string> &prompts, int max_new_tokens) {
+    if (prompts.empty()) {
+        throw std::runtime_error("generate_tokens_resident: empty prompt batch");
+    }
+
+    GenerateDebugResult result;
+    result.tokens.resize(prompts.size());
+    if (max_new_tokens <= 0) {
+        return result;
+    }
+
+    Stopwatch::reset();
+    probe_vram("startup");
+
+    BPETokenizer tok(TOKENIZER_PATH);
+    std::vector<std::vector<int>> prompt_ids;
+    prompt_ids.reserve(prompts.size());
+    for (const auto &prompt : prompts) {
+        prompt_ids.push_back(apply_chat_template(tok, prompt));
+    }
+
+    const int batch = static_cast<int>(prompts.size());
+    const int prompt_len =
+        validate_equal_lengths(prompt_ids, "generate_tokens_resident");
+
+    if (prompt_len + max_new_tokens > S_MAX) {
+        throw std::runtime_error(
+            "generate_tokens_resident: prompt + max_new_tokens exceeds S_MAX");
+    }
+
+    std::printf("  prompt batch: %d prompts, tokens each %d (s=%d)\n", batch,
+                prompt_len, prompt_len);
+
+    weights.load_global();
+    KVCache cache(S_MAX, batch);
+    probe_vram("after_kvcache_alloc");
+    load_resident_layers(&resident_weights);
+
+    float *d_cos = nullptr, *d_sin = nullptr;
+    alloc_rope_tables(&d_cos, &d_sin);
+
+    std::vector<int> lens;
+    int smax = 0;
+    std::unique_ptr<float[]> h_emb_prefill(
+        weights.get_embeddings_batched(prompt_ids, lens, smax));
+    if (smax != prompt_len) {
+        throw std::runtime_error("generate_tokens_resident: bad prefill shape");
+    }
+    auto last_hidden =
+        forward_step(h_emb_prefill.get(), prompt_len, weights, cache, d_cos,
+                     d_sin, &resident_weights, batch);
+
+    std::vector<int> next_ids(batch, EOT_ID);
+    std::vector<bool> done(batch, false);
+    for (int b = 0; b < batch; ++b) {
+        Stopwatch sw_lm("lm_head.cpu");
+        auto logits = compute_lm_head_logits(
+            weights.global().lm_head,
+            last_hidden.data() + (size_t)b * EMBEDDING_DIM);
+        next_ids[b] = static_cast<int>(
+            std::max_element(logits.begin(), logits.end()) - logits.begin());
+        result.tokens[b].push_back(next_ids[b]);
+        done[b] = (next_ids[b] == EOT_ID);
+        std::printf("  [prefill b=%d] -> token %d\n", b, next_ids[b]);
+    }
+
+    for (int step = 1; step < max_new_tokens; ++step) {
+        if (std::all_of(done.begin(), done.end(), [](bool v) { return v; })) {
+            break;
+        }
+
+        std::vector<std::vector<int>> one_ids(batch);
+        for (int b = 0; b < batch; ++b) {
+            // Finished slots stay in the lockstep batch as EOT rows; this wastes
+            // compute but keeps the v1 cache and attention layout simple.
+            one_ids[b] = {done[b] ? EOT_ID : next_ids[b]};
+        }
+
+        std::unique_ptr<float[]> h_emb_one(
+            weights.get_embeddings_batched(one_ids, lens, smax));
+        if (smax != 1) {
+            throw std::runtime_error("generate_tokens_resident: bad decode shape");
+        }
+        last_hidden = forward_step(h_emb_one.get(), 1, weights, cache, d_cos,
+                                   d_sin, &resident_weights, batch);
+
+        for (int b = 0; b < batch; ++b) {
+            if (done[b]) {
+                continue;
+            }
+            Stopwatch sw_lm("lm_head.cpu");
+            auto logits = compute_lm_head_logits(
+                weights.global().lm_head,
+                last_hidden.data() + (size_t)b * EMBEDDING_DIM);
+            next_ids[b] = static_cast<int>(
+                std::max_element(logits.begin(), logits.end()) - logits.begin());
+            result.tokens[b].push_back(next_ids[b]);
+            done[b] = (next_ids[b] == EOT_ID);
+            std::printf("  [decode %d b=%d] -> token %d\n", step, b,
+                        next_ids[b]);
+        }
+    }
+
+    cudaFree(d_cos);
+    cudaFree(d_sin);
+
+    result.last_hidden = std::move(last_hidden);
+    Stopwatch::print_summary();
+    return result;
 }
 
 int generate_next_token_impl(ModelWeights &weights,
@@ -553,6 +723,21 @@ std::vector<int> generate_tokens_resident(ModelWeights &weights,
                                           int max_new_tokens) {
     return generate_tokens_impl(weights, &resident_weights, prompt,
                                 max_new_tokens);
+}
+
+std::vector<std::vector<int>> generate_tokens_resident(
+    ModelWeights &weights, DeviceModelWeights &resident_weights,
+    const std::vector<std::string> &prompts, int max_new_tokens) {
+    return generate_tokens_resident_batched_impl(weights, resident_weights,
+                                                 prompts, max_new_tokens)
+        .tokens;
+}
+
+GenerateDebugResult generate_tokens_resident_debug(
+    ModelWeights &weights, DeviceModelWeights &resident_weights,
+    const std::vector<std::string> &prompts, int max_new_tokens) {
+    return generate_tokens_resident_batched_impl(weights, resident_weights,
+                                                 prompts, max_new_tokens);
 }
 
 std::string decode_token(int token_id) {
