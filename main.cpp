@@ -1,8 +1,20 @@
 // Llama 3 8B inference CLI.
-// Usage: ./bin/llm "prompt"                  (single token, greedy)
-//        ./bin/llm --max-tokens N "prompt"   (N-token autoregressive, KV cached)
+//
+// Steps:
+//   1. Parse the command line into a max-tokens count plus either a list of
+//      prompts or the --interactive flag.
+//   2. In interactive mode, load the weights once and answer prompts read
+//      from stdin until the user exits.
+//   3. Otherwise pick the cheapest forward-pass shape for what was asked:
+//      a single greedy token, a multi-token KV-cached decode, or a batched
+//      decode that advances several prompts in lockstep.
+//   4. Run that forward pass, decode the resulting token IDs back to text,
+//      and print the completion.
+//
+// Usage: ./bin/llm "prompt"                  (single greedy token)
+//        ./bin/llm --max-tokens N "prompt"   (N tokens, KV-cached decode)
 //        ./bin/llm --prompt "p1" --prompt "p2" --max-tokens N
-//        ./bin/llm --interactive [--max-tokens N]   (REPL: load weights once)
+//        ./bin/llm --interactive [--max-tokens N]
 
 #include "config.h"
 #include "tokenizer.h"
@@ -37,16 +49,21 @@ void print_usage(const char *argv0) {
 
 int main(int argc, char *argv[]) {
 #ifndef CUDA_ENABLED
+    // No NVIDIA GPU detected at build time, so the inference path is absent.
+    // We refuse to run rather than silently producing garbage on the CPU.
     (void)argc;
     (void)argv;
     std::cerr << "Error: inference requires CUDA (nvcc not found at build time)\n";
     return 1;
 #else
+    // Defaults: one prompt, one generated token, no batch, no REPL.
     int max_tokens = 1;
     bool interactive = false;
-    std::vector<std::string> prompts;
-    std::vector<std::string> positional_prompts;
+    std::vector<std::string> prompts;             // collected via --prompt
+    std::vector<std::string> positional_prompts;  // collected as bare argv
 
+    // Walk argv. Recognized flags consume their value (i += 2); anything
+    // unrecognized is treated as the prompt text. Order doesn't matter.
     int i = 1;
     while (i < argc) {
         if (std::strcmp(argv[i], "--max-tokens") == 0) {
@@ -80,6 +97,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // REPL mode: load weights into GPU memory once, then answer prompts in a
+    // loop. The first call ("warmup") pays the ~165s cost of copying the BF16
+    // weights to the GPU and priming caches; every prompt after that reuses
+    // the resident weights and starts generating immediately.
     if (interactive) {
         if (!prompts.empty() || !positional_prompts.empty()) {
             std::fprintf(stderr,
@@ -87,8 +108,8 @@ int main(int argc, char *argv[]) {
                          "pipe them via stdin\n");
             return 1;
         }
-        ModelWeights weights(DUMP_DIR);
-        DeviceModelWeights resident_weights(DUMP_DIR);
+        ModelWeights weights(DUMP_DIR);                  // host-side (CPU) copy
+        DeviceModelWeights resident_weights(DUMP_DIR);   // device-side (GPU) copy
 
         std::printf("[interactive] warming up resident BF16 weights "
                     "(~165s on cold start)...\n");
@@ -101,6 +122,7 @@ int main(int argc, char *argv[]) {
                     max_tokens);
         std::fflush(stdout);
 
+        // Prompt loop: read a line, generate tokens, print the completion.
         std::string line;
         while (true) {
             std::printf("> ");
@@ -121,6 +143,10 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    // Resolve prompts. The two intake forms (positional vs --prompt) are
+    // mutually exclusive: mixing them is almost always a typo. With nothing
+    // supplied we fall back to a default so `./bin/llm` alone still does
+    // something useful (handy as a smoke test).
     if (!prompts.empty() && !positional_prompts.empty()) {
         std::fprintf(stderr,
                      "Error: use either positional prompt or --prompt, not both\n");
@@ -137,8 +163,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Batched inference (B>1) processes every prompt in a single GPU forward
+    // pass, which only works if all prompts tokenize to the same length.
+    // Reject up-front with a clear error rather than failing later inside the
+    // chat-template path. We tokenize here for the length check only;
+    // inference will tokenize again when it applies the chat template.
     if (prompts.size() > 1) {
-        // Fast UX precheck; inference tokenizes again when applying the chat template.
         BPETokenizer tok(TOKENIZER_PATH);
         const int s0 = static_cast<int>(tok.encode(prompts[0]).size());
         for (size_t b = 1; b < prompts.size(); ++b) {
@@ -165,8 +195,15 @@ int main(int argc, char *argv[]) {
     }
     std::printf("Max tokens: %d\n", max_tokens);
 
+    // Pick an inference path. Three cases, each with a different cost profile:
+    //   1. one prompt, one token   -> stream weights from CPU once, generate, exit
+    //   2. one prompt, many tokens -> keep weights resident on the GPU so each
+    //                                 decode step is fast (KV cache reused)
+    //   3. many prompts (batched)  -> same as (2), but every step advances all
+    //                                 prompts together
     ModelWeights weights(DUMP_DIR);
     if (prompts.size() == 1 && max_tokens == 1) {
+        // Path 1: cheapest case. No GPU residency, no KV cache.
         int token_id = generate_next_token(weights, prompts[0]);
         std::string decoded = decode_token(token_id);
         std::printf("Generated token: %d\n", token_id);
@@ -174,6 +211,8 @@ int main(int argc, char *argv[]) {
         std::printf("Full output:     \"%s%s\"\n", prompts[0].c_str(),
                     decoded.c_str());
     } else if (prompts.size() == 1) {
+        // Path 2: multi-token decode. Pay the GPU upload cost once so each
+        // subsequent token only costs a single forward pass.
         DeviceModelWeights resident_weights(DUMP_DIR);
         auto ids = generate_tokens_resident(weights, resident_weights,
                                             prompts[0], max_tokens);
@@ -184,6 +223,8 @@ int main(int argc, char *argv[]) {
         std::printf("Full output:     \"%s%s\"\n", prompts[0].c_str(),
                     decoded.c_str());
     } else {
+        // Path 3: batched decode. One forward pass advances all B prompts in
+        // lockstep, then we print each prompt's completion separately.
         DeviceModelWeights resident_weights(DUMP_DIR);
         auto batched_ids = generate_tokens_resident(weights, resident_weights,
                                                     prompts, max_tokens);
