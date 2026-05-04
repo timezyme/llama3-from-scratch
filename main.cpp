@@ -2,6 +2,7 @@
 // Usage: ./bin/llm "prompt"                  (single token, greedy)
 //        ./bin/llm --max-tokens N "prompt"   (N-token autoregressive, KV cached)
 //        ./bin/llm --prompt "p1" --prompt "p2" --max-tokens N
+//        ./bin/llm --interactive [--max-tokens N]   (REPL: load weights once)
 
 #include "config.h"
 #include "tokenizer.h"
@@ -21,8 +22,12 @@ void print_usage(const char *argv0) {
     std::fprintf(stderr,
                  "Usage: %s [--max-tokens N] \"prompt\"\n"
                  "       %s [--max-tokens N] --prompt P [--prompt P ...]\n"
+                 "       %s --interactive [--max-tokens N]\n"
                  "  --max-tokens N   generate up to N tokens (default 1)\n"
-                 "  --prompt P       add one prompt to a batch (repeatable)\n",
+                 "  --prompt P       add one prompt to a batch (repeatable)\n"
+                 "  --interactive    REPL mode; load resident weights once, "
+                 "read prompts from stdin (Ctrl-D or 'exit' to quit)\n",
+                 argv0,
                  argv0,
                  argv0);
 }
@@ -38,6 +43,7 @@ int main(int argc, char *argv[]) {
     return 1;
 #else
     int max_tokens = 1;
+    bool interactive = false;
     std::vector<std::string> prompts;
     std::vector<std::string> positional_prompts;
 
@@ -61,6 +67,9 @@ int main(int argc, char *argv[]) {
             }
             prompts.push_back(argv[i + 1]);
             i += 2;
+        } else if (std::strcmp(argv[i], "--interactive") == 0) {
+            interactive = true;
+            ++i;
         } else if (std::strcmp(argv[i], "-h") == 0 ||
                    std::strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
@@ -69,6 +78,47 @@ int main(int argc, char *argv[]) {
             positional_prompts.push_back(argv[i]);
             ++i;
         }
+    }
+
+    if (interactive) {
+        if (!prompts.empty() || !positional_prompts.empty()) {
+            std::fprintf(stderr,
+                         "Error: --interactive does not take prompts on the CLI; "
+                         "pipe them via stdin\n");
+            return 1;
+        }
+        ModelWeights weights(DUMP_DIR);
+        DeviceModelWeights resident_weights(DUMP_DIR);
+
+        std::printf("[interactive] warming up resident BF16 weights "
+                    "(~165s on cold start)...\n");
+        std::fflush(stdout);
+        auto warmup = generate_tokens_resident(weights, resident_weights,
+                                                "warmup", 1);
+        (void)warmup;
+        std::printf("\n[interactive] ready. max-tokens per prompt: %d. "
+                    "Ctrl-D or 'exit' to quit.\n",
+                    max_tokens);
+        std::fflush(stdout);
+
+        std::string line;
+        while (true) {
+            std::printf("> ");
+            std::fflush(stdout);
+            if (!std::getline(std::cin, line)) break;
+            if (line.empty()) continue;
+            if (line == "exit" || line == "quit") break;
+
+            auto ids = generate_tokens_resident(weights, resident_weights,
+                                                 line, max_tokens);
+            std::string decoded;
+            for (int id : ids) decoded += decode_token(id);
+            std::printf("\n%s%s\n\n", line.c_str(), decoded.c_str());
+            std::fflush(stdout);
+        }
+
+        std::printf("\n[interactive] exit\n");
+        return 0;
     }
 
     if (!prompts.empty() && !positional_prompts.empty()) {
