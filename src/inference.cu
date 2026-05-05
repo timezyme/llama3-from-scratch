@@ -68,86 +68,59 @@ std::vector<int> apply_chat_template(const BPETokenizer &tok,
     return ids;
 }
 
-// GQA attention across all heads.
-// Q has shape [q_seq, NUM_HEADS * HEAD_DIM] in row-major host memory.
-// K, V have shape [kv_seq, NUM_KV_HEADS * HEAD_DIM] in row-major host memory.
-// q_offset is the position of Q's first row in the global sequence
-// (0 for prefill, cache.len() for decode), used to mask only when needed.
-// Causal mask is applied only when q_seq == kv_seq (full prefill).
-// For decode (q_seq=1, kv_seq=len+1) all kv positions are valid by
-// construction; mask is skipped.
-void run_attention_heads(const std::vector<float> &h_Q,
-                         const std::vector<float> &h_K,
-                         const std::vector<float> &h_V,
-                         std::vector<float> &attn_concat,
-                         int q_seq, int kv_seq) {
+// Per-head scratch buffers. Sized once per forward_step (q_seq and kv_seq are
+// fixed across the layer loop) and reused for every layer * batch * head.
+struct AttentionScratch {
+    float *d_Qi = nullptr;  // [q_seq, HEAD_DIM]
+    float *d_KgT = nullptr; // [HEAD_DIM, kv_seq]  (transposed gather)
+    float *d_Vg = nullptr;  // [kv_seq, HEAD_DIM]
+    float *d_S = nullptr;   // [q_seq, kv_seq]
+    float *d_Oi = nullptr;  // [q_seq, HEAD_DIM]
+};
+
+// GQA attention across all heads, fully on-device.
+// d_Q_b: [q_seq, NUM_HEADS * HEAD_DIM] device pointer for one batch slot.
+// d_K_b, d_V_b: [kv_seq, NUM_KV_HEADS * HEAD_DIM] device pointers (typically
+//               into the KV cache; only the first kv_seq rows are read).
+// d_attn_b:    [q_seq, NUM_HEADS * HEAD_DIM] device output, written per-head.
+// scratch:     caller-owned per-head scratch buffers (see AttentionScratch).
+// Causal mask is applied only when q_seq == kv_seq (full prefill); decode
+// (q_seq=1) skips it because every cached position is in-bounds.
+void run_attention_heads(const float *d_Q_b, const float *d_K_b,
+                         const float *d_V_b, float *d_attn_b,
+                         const AttentionScratch &scratch, int q_seq,
+                         int kv_seq) {
     const int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    const int q_stride = EMBEDDING_DIM; // NUM_HEADS * HEAD_DIM
     const int heads_per_group = NUM_HEADS / NUM_KV_HEADS;
     const float scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
     const bool apply_mask = (q_seq == kv_seq && q_seq > 1);
 
-    float *d_Qi = nullptr, *d_KgT = nullptr, *d_Vg = nullptr;
-    float *d_S = nullptr, *d_Oi = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_Qi, q_seq * HEAD_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_KgT, HEAD_DIM * kv_seq * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Vg, kv_seq * HEAD_DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_S, q_seq * kv_seq * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_Oi, q_seq * HEAD_DIM * sizeof(float)));
-
     for (int hi = 0; hi < NUM_HEADS; ++hi) {
         int kvg = hi / heads_per_group;
-        std::vector<float> hQi(q_seq * HEAD_DIM);
-        std::vector<float> hKgT(HEAD_DIM * kv_seq);
-        std::vector<float> hVg(kv_seq * HEAD_DIM);
 
-        for (int p = 0; p < q_seq; ++p) {
-            for (int d2 = 0; d2 < HEAD_DIM; ++d2) {
-                hQi[p * HEAD_DIM + d2] =
-                    h_Q[p * EMBEDDING_DIM + hi * HEAD_DIM + d2];
-            }
-        }
-        for (int p = 0; p < kv_seq; ++p) {
-            for (int d2 = 0; d2 < HEAD_DIM; ++d2) {
-                hKgT[d2 * kv_seq + p] =
-                    h_K[p * kv_dim + kvg * HEAD_DIM + d2];
-                hVg[p * HEAD_DIM + d2] =
-                    h_V[p * kv_dim + kvg * HEAD_DIM + d2];
-            }
-        }
+        // Slice per-head Q, K (transposed), V directly from device buffers.
+        gpu_gather_head(d_Q_b, scratch.d_Qi, q_seq, HEAD_DIM, q_stride,
+                        hi * HEAD_DIM);
+        gpu_gather_head_transpose(d_K_b, scratch.d_KgT, kv_seq, HEAD_DIM,
+                                  kv_dim, kvg * HEAD_DIM);
+        gpu_gather_head(d_V_b, scratch.d_Vg, kv_seq, HEAD_DIM, kv_dim,
+                        kvg * HEAD_DIM);
 
-        CUDA_CHECK(cudaMemcpy(d_Qi, hQi.data(),
-                               q_seq * HEAD_DIM * sizeof(float),
-                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_KgT, hKgT.data(),
-                               HEAD_DIM * kv_seq * sizeof(float),
-                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_Vg, hVg.data(),
-                               kv_seq * HEAD_DIM * sizeof(float),
-                               cudaMemcpyHostToDevice));
-
-        gpu_matmul_device(d_Qi, d_KgT, d_S, q_seq, HEAD_DIM, kv_seq);
-        gpu_scale(d_S, q_seq * kv_seq, scale);
+        gpu_matmul_device(scratch.d_Qi, scratch.d_KgT, scratch.d_S, q_seq,
+                          HEAD_DIM, kv_seq);
+        gpu_scale(scratch.d_S, q_seq * kv_seq, scale);
         if (apply_mask) {
-            gpu_causal_mask(d_S, q_seq);
+            gpu_causal_mask(scratch.d_S, q_seq);
         }
-        gpu_softmax(d_S, q_seq, kv_seq);
-        gpu_matmul_device(d_S, d_Vg, d_Oi, q_seq, kv_seq, HEAD_DIM);
+        gpu_softmax(scratch.d_S, q_seq, kv_seq);
+        gpu_matmul_device(scratch.d_S, scratch.d_Vg, scratch.d_Oi, q_seq,
+                          kv_seq, HEAD_DIM);
 
-        std::vector<float> hOi(q_seq * HEAD_DIM);
-        CUDA_CHECK(cudaMemcpy(hOi.data(), d_Oi,
-                               q_seq * HEAD_DIM * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-        for (int p = 0; p < q_seq; ++p)
-            for (int d2 = 0; d2 < HEAD_DIM; ++d2)
-                attn_concat[p * EMBEDDING_DIM + hi * HEAD_DIM + d2] =
-                    hOi[p * HEAD_DIM + d2];
+        // Write this head's output directly into the stitched attention buffer.
+        gpu_scatter_head(scratch.d_Oi, d_attn_b, q_seq, HEAD_DIM, q_stride,
+                         hi * HEAD_DIM);
     }
-
-    CUDA_CHECK(cudaFree(d_Qi));
-    CUDA_CHECK(cudaFree(d_KgT));
-    CUDA_CHECK(cudaFree(d_Vg));
-    CUDA_CHECK(cudaFree(d_S));
-    CUDA_CHECK(cudaFree(d_Oi));
 }
 
 // CPU dot-product over [VOCAB_SIZE, EMBEDDING_DIM] @ [EMBEDDING_DIM].
@@ -196,10 +169,6 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     }
 
     const size_t bytes_X = static_cast<size_t>(rows) * d * sizeof(float);
-    const size_t bytes_X_one_batch =
-        static_cast<size_t>(q_seq) * d * sizeof(float);
-    const size_t bytes_Xkv_full = static_cast<size_t>(kv_seq) * kv_dim *
-                                   sizeof(float);
     const size_t bytes_ffn = static_cast<size_t>(rows) * FFN_DIM *
                               sizeof(float);
 
@@ -230,6 +199,20 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     CUDA_CHECK(cudaMalloc(&d_gate, bytes_ffn));
     CUDA_CHECK(cudaMalloc(&d_up, bytes_ffn));
     CUDA_CHECK(cudaMalloc(&d_ffn, bytes_X));
+
+    // Per-head attention scratch — allocated once, reused across every
+    // (layer, batch, head). q_seq and kv_seq are fixed for this forward_step.
+    AttentionScratch scratch;
+    CUDA_CHECK(cudaMalloc(&scratch.d_Qi,
+                          static_cast<size_t>(q_seq) * HEAD_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&scratch.d_KgT,
+                          static_cast<size_t>(HEAD_DIM) * kv_seq * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&scratch.d_Vg,
+                          static_cast<size_t>(kv_seq) * HEAD_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&scratch.d_S,
+                          static_cast<size_t>(q_seq) * kv_seq * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&scratch.d_Oi,
+                          static_cast<size_t>(q_seq) * HEAD_DIM * sizeof(float)));
 
     CUDA_CHECK(cudaMemcpy(d_X, h_input, bytes_X, cudaMemcpyHostToDevice));
 
@@ -321,37 +304,23 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        // Copy Q (q_seq rows) and full cached K/V (kv_seq rows) to host for the
-        // host-orchestrated per-head attention loop. (See TODO #8: move this on-device.)
-        // With B>1 this sequential loop multiplies the transfer and reshape cost by B.
-        std::vector<float> attn_concat(static_cast<size_t>(rows) * d, 0.0f);
+        // Per-head attention, fully on-device: each batch's Q/K/V already
+        // live on the GPU (Q in d_Q, K/V in the KV cache). The gather/scatter
+        // kernels slice per-head views without ever crossing PCIe.
         {
             Stopwatch sw("layer.attn_heads");
             for (int b = 0; b < batch; ++b) {
-                std::vector<float> h_Q(q_seq * d);
-                std::vector<float> h_K(kv_seq * kv_dim);
-                std::vector<float> h_V(kv_seq * kv_dim);
-                CUDA_CHECK(cudaMemcpy(
-                    h_Q.data(), d_Q + static_cast<size_t>(b) * q_seq * d,
-                    bytes_X_one_batch, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_K.data(), cache.k_batch(layer, b),
-                                      bytes_Xkv_full, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(h_V.data(), cache.v_batch(layer, b),
-                                      bytes_Xkv_full, cudaMemcpyDeviceToHost));
-
-                std::vector<float> attn_one(static_cast<size_t>(q_seq) * d,
-                                            0.0f);
-                run_attention_heads(h_Q, h_K, h_V, attn_one, q_seq, kv_seq);
-                std::copy(attn_one.begin(), attn_one.end(),
-                          attn_concat.begin() +
-                              static_cast<size_t>(b) * q_seq * d);
+                run_attention_heads(
+                    d_Q + static_cast<size_t>(b) * q_seq * d,
+                    cache.k_batch(layer, b), cache.v_batch(layer, b),
+                    d_attn + static_cast<size_t>(b) * q_seq * d, scratch,
+                    q_seq, kv_seq);
             }
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         {
             Stopwatch sw("layer.post_attn_and_ffn");
-            CUDA_CHECK(cudaMemcpy(d_attn, attn_concat.data(), bytes_X,
-                                   cudaMemcpyHostToDevice));
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_attn, resident_lw->o_proj,
                                               d_attn_out, rows, d, d);
@@ -419,6 +388,8 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     cudaFree(d_wgate); cudaFree(d_wup); cudaFree(d_wdown);
     cudaFree(d_attn); cudaFree(d_attn_out);
     cudaFree(d_gate); cudaFree(d_up); cudaFree(d_ffn);
+    cudaFree(scratch.d_Qi); cudaFree(scratch.d_KgT); cudaFree(scratch.d_Vg);
+    cudaFree(scratch.d_S); cudaFree(scratch.d_Oi);
 
     return last_hidden;
 }

@@ -11,8 +11,9 @@ cd "$REPO_ROOT"
 source .l4-config.env
 [[ -n "${GCLOUD_PATH:-}" ]] && export PATH="$GCLOUD_PATH:$PATH"
 
-ZONE="${PREFERRED_ZONE:-us-east1-c}"
+ZONE=$(gcloud compute instances list --filter="name=$VM_NAME" --format="value(zone.basename())" 2>/dev/null | head -1)
+[[ -n "$ZONE" ]] || { echo "ERROR: VM '$VM_NAME' not found in this project."; exit 1; }
 
-echo "[demo] stopping $VM_NAME..."
+echo "[demo] stopping $VM_NAME in $ZONE..."
 gcloud compute instances stop "$VM_NAME" --zone="$ZONE" --quiet >/dev/null
 gcloud compute instances list --filter="name=$VM_NAME" --format="value(name,status)"

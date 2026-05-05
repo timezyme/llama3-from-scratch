@@ -69,6 +69,15 @@ void gpu_causal_mask(float *d_S, int s);
 // data: [rows, cols]. Subtracts row max before exp, then normalizes.
 void gpu_softmax(float *d_data, int rows, int cols);
 
+// Strided per-head gather/scatter, used to slice/place one head's [rows, head_dim]
+// inside a packed [rows, stride] tensor on the device. No host transfers.
+void gpu_gather_head(const float *d_src, float *d_dst, int rows, int head_dim,
+                     int src_stride, int head_offset);
+void gpu_gather_head_transpose(const float *d_src, float *d_dst, int rows,
+                               int head_dim, int src_stride, int head_offset);
+void gpu_scatter_head(const float *d_src, float *d_dst, int rows, int head_dim,
+                      int dst_stride, int head_offset);
+
 // -----------------------------------------------------------------------
 // SwiGLU: output[i] = SiLU(gate[i]) * up[i]
 // SiLU(x) = x / (1 + exp(-x))

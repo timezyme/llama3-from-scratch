@@ -62,144 +62,27 @@ shows old per-layer streaming timers.
 
 ## GCP GPU VM setup
 
-You need a GPU to run the CUDA kernels. These instructions use a GCP spot instance with an NVIDIA T4 (~$0.16/hr).
-
-### Create the VM
+The full L4 provisioning + test + demo workflow is automated. See [`docs/RUNBOOK-L4.md`](./docs/RUNBOOK-L4.md) for details.
 
 ```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
+cp .l4-config.env.example .l4-config.env       # set VM_NAME, PREFERRED_ZONE, etc.
+echo "HUGGINGFACE_TOKEN=hf_..." > .env
 
-gcloud compute instances create llama3-gpu \
-  --zone=us-central1-a \
-  --machine-type=n1-standard-4 \
-  --accelerator=type=nvidia-tesla-t4,count=1 \
-  --maintenance-policy=TERMINATE \
-  --provisioning-model=SPOT \
-  --image-family=common-cu128-ubuntu-2204-nvidia-570 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=50GB \
-  --boot-disk-type=pd-balanced \
-  --metadata="install-nvidia-driver=True" \
-  --scopes=default
+./tools/provision_l4.sh                        # create VM, install drivers, download weights, run dumper
+./tools/test_l4.sh --quick --no-stop           # rsync source, build, run quick test lane, leave VM up
+./tools/create_custom_image.sh                 # snapshot the warm disk for ~60s future boots (optional)
 ```
 
-### First-time VM setup
+After capturing the custom image, future `provision_l4.sh` runs boot in ~60s with everything pre-baked. The demo wrapper scripts auto-detect the VM zone:
 
 ```bash
-gcloud compute ssh llama3-gpu --zone=us-central1-a
-
-# On the VM:
-sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3-pip
-pip3 install huggingface_hub safetensors numpy torch --index-url https://download.pytorch.org/whl/cpu
-
-echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### Start / stop VM
-
-```bash
-gcloud compute instances start llama3-gpu --zone=us-central1-a
-gcloud compute instances stop llama3-gpu --zone=us-central1-a    # ~$0.005/hr disk only
-gcloud compute instances delete llama3-gpu --zone=us-central1-a  # zero cost
-```
-
-### Copy project to the VM
-
-```bash
-gcloud compute scp --recurse --zone=us-central1-a . llama3-gpu:~/llama3
-gcloud compute scp --zone=us-central1-a src/loader.cpp llama3-gpu:~/llama3/src/loader.cpp
-```
-
-## Model download and weight dumping
-
-### Download Llama 3 8B (~90 seconds on VM)
-
-```bash
-cd ~/llama3
-HF_TOKEN=<your-token> python3 tools/llama3_downloader.py --out ./assets/llama3/
-```
-
-### Generate token.model
-
-The Hugging Face download gives you `tokenizer.json` (GPT-style byte encoding), but the C++ tokenizer expects a raw-byte rank file. This script converts it:
-
-```bash
-python3 -c "
-import json, base64
-
-with open('assets/llama3/tokenizer.json') as f:
-    data = json.load(f)
-vocab = data['model']['vocab']
-
-def bytes_to_unicode():
-    bs = list(range(ord('!'), ord('~')+1)) + list(range(ord('¡'), ord('¬')+1)) + list(range(ord('®'), ord('ÿ')+1))
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    return dict(zip(bs, cs))
-
-b2u = bytes_to_unicode()
-u2b = {chr(v): bytes([k]) for k, v in b2u.items()}
-
-def token_to_bytes(token_str):
-    raw = b''
-    for ch in token_str:
-        if ch in u2b:
-            raw += u2b[ch]
-        else:
-            raw += ch.encode('utf-8')
-    return raw
-
-with open('assets/llama3/token.model', 'w') as out:
-    for token_str, rank in sorted(vocab.items(), key=lambda x: x[1]):
-        b64 = base64.b64encode(token_to_bytes(token_str)).decode('ascii')
-        out.write(f'{b64} {rank}\n')
-
-print(f'Wrote {len(vocab)} entries')
-"
-```
-
-### Dump weights
-
-```bash
-python3 tools/dumper.py
-# Outputs 291 tensors to assets/llama3/dump/
-# Embeddings: assets/llama3/dump/embeddings.bin
-# Layers:     assets/llama3/dump/layer_XX/
-# Global:     assets/llama3/dump/global/
-# Manifest:   assets/llama3/dump/manifest.json
-```
-
-## Building and testing on the VM
-
-```bash
-gcloud compute ssh llama3-gpu --zone=us-central1-a
-cd ~/llama3
-export PATH=/usr/local/cuda/bin:$PATH
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-
-make clean && make && make tests && make tests_m2m3
-
-# Run M1 tests
-for i in 1 2 3 4 5 6 7; do ./bin/tests $i; done
-
-# Run M2-3 tests
-for t in $(./bin/tests_m2m3 --list); do ./bin/tests_m2m3 $t; done
-
-# Single-token inference
-./bin/llm "The capital of France is"
+./scripts/demo-start.sh 32                     # start VM, SSH in, drop into bin/llm --interactive
+./scripts/demo-stop.sh                         # stop the VM after the demo
 ```
 
 ## Test results
 
-All 7 M1 tests and 27 M2-3 tests pass on a GCP T4 (n1-standard-4). CLI inference produces correct tokens validated against PyTorch.
+All 7 M1 tests and 30 M2-3 tests pass on a GCP L4 (g2-standard-4, sm_89). CLI inference produces correct tokens validated against PyTorch.
 
 ### Milestone 1 (tokenizer, embeddings, matmul)
 
@@ -215,7 +98,7 @@ All 7 M1 tests and 27 M2-3 tests pass on a GCP T4 (n1-standard-4). CLI inference
 
 ### Milestones 2-3 (CUDA kernels, full inference)
 
-27 tests covering RMSNorm, RoPE, attention (scale, causal mask, softmax, GQA), SwiGLU, residual add, single-layer forward pass, and full 32-layer inference. Run with:
+30 tests covering RMSNorm, RoPE, attention (scale, causal mask, softmax, GQA), SwiGLU, residual add, BF16-weight matmul parity, B>1 batched parity, KV-cache bounds, single-layer forward pass, and full 32-layer inference. Run with:
 
 ```bash
 ./bin/tests_m2m3 --list   # list all test names
@@ -236,7 +119,7 @@ Both prompts agree with `reference.py` to a per-op max abs diff < 1e-5 in layer 
 ## Project structure
 
 ```
-main.cpp                 # CLI entry point (single-token inference)
+main.cpp                 # CLI entry point (single-token / multi-token / interactive / batched)
 config.h                 # Llama 3 8B architecture constants
 reference.py             # PyTorch grading reference (used by TAs)
 include/
@@ -246,15 +129,18 @@ include/
   milifloat.h            # BF16/FP16 → FP32 converters
   model_weights.h        # Per-layer and global weight management
   inference.h            # Forward-pass entry points
+  kv_cache.h             # Device-side per-layer K/V buffers (multi-token decode)
+  instrument.h           # Header-only Stopwatch + probe_vram telemetry
   operator.cuh           # AbstractOperator base class (scaffold)
 src/
   tokenizer_bpe.cpp      # BPE tokenizer (encode/decode with special tokens)
   loader.cpp             # Weight loader (280-byte header + BF16/FP16/FP32 payload)
   model_weights.cpp      # Weight loading with transpose-at-load
   inference.cu           # 32-layer forward pass with chat template
+  kv_cache.cu            # cudaMalloc/cudaFree per-layer K/V buffers
 kernel/
   kernels.cuh            # Host-callable kernel entry points
-  matmul.cu              # Tiled GEMM (double-buffered shared memory, float4 loads)
+  matmul.cu              # Tiled GEMM (double-buffered shared memory, float4 loads, BF16-weight variant)
   matmul_cpu.cpp         # CPU fallback for non-CUDA builds
   rmsnorm.cu             # Row-wise RMSNorm with shared-memory reduction
   rope.cu                # Rotary position embeddings (rotate_full convention)
@@ -269,9 +155,15 @@ tests/
 tools/
   llama3_downloader.py   # Download weights from Hugging Face
   dumper.py              # Safetensors → binary dump (280-byte header + payload)
+  gen_token_model.py     # tokenizer.json → BPE rank file (token.model)
   gen_m2m3_fixtures.py   # Generate golden test fixtures via NumPy
   verify_reference.py    # Compare reference.py vs our NumPy logic on real weights
   token_show.py          # Token inspection utility
-docs/
-  Milestone1-Report.pdf  # Project report
+  provision_l4.sh        # GCP L4 VM provision (SPOT/STANDARD; uses custom image if available)
+  test_l4.sh             # Push source, build, run M1+M2-3 lane on L4
+  create_custom_image.sh # Snapshot warm L4 boot disk for fast (~60s) re-provision
+scripts/
+  demo-start.sh          # Auto-detect zone, start L4, SSH into bin/llm --interactive
+  demo-stop.sh           # Auto-detect zone, stop the L4 VM
+  run_tests.sh           # Local test runner
 ```

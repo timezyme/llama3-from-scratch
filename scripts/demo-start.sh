@@ -18,7 +18,9 @@ source .l4-config.env
 [[ -n "${GCLOUD_PATH:-}" ]] && export PATH="$GCLOUD_PATH:$PATH"
 
 MAX_TOKENS="${1:-32}"
-ZONE="${PREFERRED_ZONE:-us-east1-c}"
+
+ZONE=$(gcloud compute instances list --filter="name=$VM_NAME" --format="value(zone.basename())" 2>/dev/null | head -1)
+[[ -n "$ZONE" ]] || { echo "ERROR: VM '$VM_NAME' not found in this project. Provision it with ./tools/provision_l4.sh"; exit 1; }
 
 echo "[demo] starting $VM_NAME in $ZONE..."
 gcloud compute instances start "$VM_NAME" --zone="$ZONE" >/dev/null

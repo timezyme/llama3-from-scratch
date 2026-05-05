@@ -4,6 +4,8 @@
 // - Causal mask application (add -1e6 to upper triangle)
 // - Numerically stable softmax (max subtraction before exp)
 // - Scale kernel (multiply by 1/sqrt(h_d))
+// - Per-head strided gather/scatter (used to slice a single head out of
+//   the row-major [seq, num_heads * head_dim] layout without leaving the GPU)
 
 #include "kernel/kernels.cuh"
 
@@ -100,6 +102,61 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     }
 }
 
+// Strided gather of a single head's [rows, head_dim] slice out of a packed
+// [rows, src_stride] tensor. dst[r, c] = src[r, head_offset + c].
+__global__ void gather_head_kernel(const float *__restrict__ src,
+                                   float *__restrict__ dst, int rows,
+                                   int head_dim, int src_stride,
+                                   int head_offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * head_dim;
+    if (idx >= total) return;
+    int r = idx / head_dim;
+    int c = idx % head_dim;
+    dst[r * head_dim + c] = src[r * src_stride + head_offset + c];
+}
+
+// Same gather but transposes from [rows, head_dim] to [head_dim, rows], so
+// downstream matmul can consume a row-major K^T with shape [HEAD_DIM, kv_seq].
+// Tiled with shared memory so both src loads (consecutive c) and dst stores
+// (consecutive r) are coalesced; the +1 padding on the inner tile dim avoids
+// shared-memory bank conflicts during the transpose.
+constexpr int GATHER_T_TILE = 32;
+__global__ void gather_head_transpose_kernel(const float *__restrict__ src,
+                                             float *__restrict__ dst, int rows,
+                                             int head_dim, int src_stride,
+                                             int head_offset) {
+    __shared__ float tile[GATHER_T_TILE][GATHER_T_TILE + 1];
+
+    int r_in = blockIdx.y * GATHER_T_TILE + threadIdx.y;
+    int c_in = blockIdx.x * GATHER_T_TILE + threadIdx.x;
+    if (r_in < rows && c_in < head_dim) {
+        tile[threadIdx.y][threadIdx.x] =
+            src[r_in * src_stride + head_offset + c_in];
+    }
+    __syncthreads();
+
+    int c_out = blockIdx.x * GATHER_T_TILE + threadIdx.y;
+    int r_out = blockIdx.y * GATHER_T_TILE + threadIdx.x;
+    if (c_out < head_dim && r_out < rows) {
+        dst[c_out * rows + r_out] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+// Inverse of gather_head_kernel: write a [rows, head_dim] head back into
+// dst[r, head_offset + c] inside a [rows, dst_stride] packed tensor.
+__global__ void scatter_head_kernel(const float *__restrict__ src,
+                                    float *__restrict__ dst, int rows,
+                                    int head_dim, int dst_stride,
+                                    int head_offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * head_dim;
+    if (idx >= total) return;
+    int r = idx / head_dim;
+    int c = idx % head_dim;
+    dst[r * dst_stride + head_offset + c] = src[r * head_dim + c];
+}
+
 // --- Host entry points ---
 
 void gpu_scale(float *d_data, int count, float scale) {
@@ -128,4 +185,37 @@ void gpu_softmax(float *d_data, int rows, int cols) {
     softmax_kernel<<<rows, threads, shared_bytes>>>(d_data, rows, cols);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void gpu_gather_head(const float *d_src, float *d_dst, int rows, int head_dim,
+                     int src_stride, int head_offset) {
+    if (rows <= 0 || head_dim <= 0) return;
+    int total = rows * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    gather_head_kernel<<<blocks, threads>>>(d_src, d_dst, rows, head_dim,
+                                            src_stride, head_offset);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gpu_gather_head_transpose(const float *d_src, float *d_dst, int rows,
+                               int head_dim, int src_stride, int head_offset) {
+    if (rows <= 0 || head_dim <= 0) return;
+    dim3 block(GATHER_T_TILE, GATHER_T_TILE);
+    dim3 grid((head_dim + GATHER_T_TILE - 1) / GATHER_T_TILE,
+              (rows + GATHER_T_TILE - 1) / GATHER_T_TILE);
+    gather_head_transpose_kernel<<<grid, block>>>(d_src, d_dst, rows, head_dim,
+                                                  src_stride, head_offset);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gpu_scatter_head(const float *d_src, float *d_dst, int rows, int head_dim,
+                      int dst_stride, int head_offset) {
+    if (rows <= 0 || head_dim <= 0) return;
+    int total = rows * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    scatter_head_kernel<<<blocks, threads>>>(d_src, d_dst, rows, head_dim,
+                                             dst_stride, head_offset);
+    CUDA_CHECK(cudaGetLastError());
 }
