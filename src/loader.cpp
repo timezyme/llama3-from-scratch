@@ -1,8 +1,7 @@
-// Binary weight loader for Llama 3 model dumps.
-// Reads tensor files produced by tools/dumper.py (safetensors -> binary format).
-// Each dump file has a fixed 280-byte header followed by a raw payload in
-// FP32, FP16, or BF16. This loader parses the header, validates shapes,
-// and converts all values to FP32 for use in the inference pipeline.
+// Binary weight loader for llm_part1 §3.1.1 Step 3.
+// tools/dumper.py emits one .bin per tensor: a 280-byte header followed
+// by FP32, FP16, or BF16 payload bytes. The streaming path widens values
+// to FP32; the resident-weight path can keep raw BF16 bits.
 
 #include "loader.h"
 
@@ -17,12 +16,16 @@
 
 namespace {
 
-// Dump file header layout (280 bytes total):
-//   [0..255]   tensor name (null-padded ASCII)
-//   [256..259] dtype code (uint32 LE): 0=FP32, 1=FP16, 2=BF16
-//   [260..263] ndims (uint32 LE): 1 or 2
-//   [264..271] shape[0] (uint64 LE)
-//   [272..279] shape[1] (uint64 LE, 0 for 1D tensors)
+// Dump-file header layout (280 bytes, all little-endian). This format
+// is what tools/dumper.py writes; both producer and consumer must agree
+// on it exactly. Strict validation here is a deliberate guardrail —
+// silent header drift is the kind of bug that produces "model runs but
+// outputs garbage", which is hard to debug after the fact.
+//   [0..255]   tensor name (ASCII, null-padded)
+//   [256..259] dtype code (uint32): 0=FP32, 1=FP16, 2=BF16
+//   [260..263] ndims (uint32): 1 or 2
+//   [264..271] shape[0] (uint64)
+//   [272..279] shape[1] (uint64; 0 when ndims==1)
 constexpr size_t kTensorNameBytes = 256;
 constexpr size_t kHeaderSize = kTensorNameBytes + 4 + 4 + 8 + 8;
 
@@ -39,7 +42,9 @@ struct TensorHeader {
     uint64_t shape1 = 0;
 };
 
-// Check host byte order — dump files are always little-endian.
+// Detect host byte order. Dump files are always little-endian (every
+// platform we run on is LE), but we still detect it explicitly so that
+// big-endian hosts get a clear error rather than wrong numbers.
 bool is_little_endian_host() {
     uint16_t x = 1;
     return *reinterpret_cast<uint8_t *>(&x) == 1;
@@ -58,8 +63,10 @@ uint32_t bytes_per_element(uint32_t dtype_code) {
     }
 }
 
-// Read a little-endian uint32 from a byte pointer.
-// Fast path: memcpy on LE hosts. Manual byte assembly on BE hosts.
+// Read a little-endian uint32 from a byte pointer. memcpy is the
+// alias-safe equivalent of *(const uint32_t*)p (which is UB on
+// platforms where p is not 4-byte aligned). On big-endian hosts we
+// reassemble bytes manually so dump files load correctly anyway.
 uint32_t read_u32_le(const uint8_t *p) {
     if (is_little_endian_host()) {
         uint32_t v = 0;
@@ -86,7 +93,10 @@ uint64_t read_u64_le(const uint8_t *p) {
     return v;
 }
 
-// Multiply two sizes with overflow detection. Throws on overflow.
+// Multiply two size_t values, throwing on overflow. The lm_head tensor
+// has 128256 * 4096 elements which fits in 32 bits comfortably, but the
+// allocator checks all use the result in size_t arithmetic and a
+// silent overflow on a malformed dump file would be hard to catch.
 size_t checked_mul(size_t a, size_t b, const char *context) {
     if (a == 0 || b == 0) {
         return 0;
@@ -125,9 +135,10 @@ void validate_file_size(const std::vector<uint8_t> &blob,
     }
 }
 
-// Parse the 280-byte header from the front of a dump file blob.
-// Extracts the tensor name (null-terminated within 256 bytes), dtype,
-// number of dimensions, and shape.
+// Parse the 280-byte header at the start of a dump-file blob into
+// a TensorHeader struct. The tensor name occupies the first 256 bytes
+// as a null-padded ASCII string; everything after is fixed-width LE
+// integers (see kDtypeFP32/etc. above for the dtype codes).
 TensorHeader parse_header(const std::vector<uint8_t> &blob) {
     if (blob.size() < kHeaderSize) {
         throw runtime_error("dump file too small to contain header");
@@ -174,8 +185,10 @@ std::vector<uint8_t> read_file_binary(const string &path) {
     return data;
 }
 
-// Convert a single raw element (FP32/FP16/BF16) to a float.
-// Uses memcpy to avoid strict-aliasing issues with reinterpret_cast.
+// Decode one element from the payload to FP32 based on the dtype code.
+// FP32 is a straight memcpy. FP16 and BF16 widen via the converters in
+// milifloat.h. memcpy (rather than reinterpret_cast) keeps this
+// alias-safe regardless of payload alignment.
 float decode_value(const uint8_t *ptr, uint32_t dtype_code) {
     switch (dtype_code) {
     case kDtypeFP32: {
@@ -198,9 +211,9 @@ float decode_value(const uint8_t *ptr, uint32_t dtype_code) {
     }
 }
 
-// Load a 1D or 2D tensor from a dump file, validating that the header's
-// shape matches the expected dimensions. Returns a heap-allocated FP32 array
-// (caller takes ownership).
+// Load a 1D or 2D tensor with full shape and size validation, then
+// decode every element to FP32. Returns a heap-allocated FP32 array
+// (caller owns it via delete[]).
 float_t *load_dense_tensor_checked(const string &dump_file, size_t dim0,
                                    size_t dim1, bool is_2d) {
     std::vector<uint8_t> blob = read_file_binary(dump_file);
@@ -220,6 +233,10 @@ float_t *load_dense_tensor_checked(const string &dump_file, size_t dim0,
     return out.release();
 }
 
+// Load a BF16-only tensor without widening to FP32. Used by the
+// resident-VRAM path so we keep weights at half precision in GPU
+// memory (cuts weight HBM traffic in half during matmul). Falls back
+// to a clear error if the dump dtype isn't BF16.
 std::vector<uint16_t> load_bf16_raw_tensor_checked(const string &dump_file,
                                                    size_t dim0, size_t dim1,
                                                    bool is_2d) {
@@ -253,8 +270,10 @@ LlamaDumpLoader::LlamaDumpLoader(DumpFloatType float_type)
 
 LlamaDumpLoader::~LlamaDumpLoader() = default;
 
-// Return the vocab size (number of rows) from the embedding dump file.
-// Caches the loaded blob so repeated calls with the same path are free.
+// Read just the embedding dump's vocab size (= shape[0]) by loading
+// and caching the file. Subsequent calls (and any later
+// get_embeddings) reuse the cached blob, so this is "free" after the
+// first hit.
 size_t LlamaDumpLoader::vocab_size(const std::string &dump_path,
                                    int embedding_dim) {
     if (embedding_dim <= 0) {
@@ -273,8 +292,14 @@ size_t LlamaDumpLoader::vocab_size(const std::string &dump_path,
     return embeddings_vocab_size_;
 }
 
-// Load the embedding table dump into memory, caching the raw blob
-// so get_embeddings() can decode rows on demand without re-reading the file.
+// Load the entire embedding dump into memory and cache the blob.
+//
+// We do not eagerly decode all 128256 rows to FP32 because most prompts
+// only touch a few dozen unique tokens. Instead the raw payload stays
+// in memory and get_embeddings() decodes only the rows the caller
+// asks for — this is the embedding-lookup pattern from llm_part1
+// §3.1.1 Step 4. Returns false on header/shape mismatch so callers can
+// surface a clean error.
 bool LlamaDumpLoader::load_embeddings(const std::string &dump_path,
                                       int embedding_dim) {
     if (embedding_dim <= 0) {
@@ -317,9 +342,12 @@ bool LlamaDumpLoader::load_embeddings(const std::string &dump_path,
     return true;
 }
 
-// Look up embedding vectors for a list of token IDs.
-// Returns a heap-allocated FP32 array of shape [token_ids.size(), embedding_dim].
-// Decodes each row from the cached blob's native dtype (BF16/FP16/FP32) to FP32.
+// Embedding lookup (Milestone 1 Step 4): given a sequence of token IDs,
+// produce the [s, d] FP32 embedding matrix that feeds the first
+// decoder block. Each row is gathered from the cached payload at
+// offset `token_id * row_bytes` and decoded to FP32.
+//
+// Result is heap-allocated; caller owns it and must delete[].
 float_t *LlamaDumpLoader::get_embeddings(const std::vector<int> &token_ids) {
     if (embeddings_blob_.empty()) {
         throw runtime_error(

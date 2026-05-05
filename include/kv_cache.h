@@ -1,16 +1,24 @@
-// KV cache for incremental autoregressive decoding.
+// Key/Value cache for optional incremental autoregressive decoding.
+// llm_part1 §3.1.1 makes KV caching optional, but the layout here
+// follows llm_part2 §3.3's discussion of avoiding repeated prefix work.
 //
-// Stores per-layer K and V on the device so each generation step only
-// needs to project Q for the new token and append one K/V row instead
-// of recomputing the full sequence.
+// Holds, per decoder layer, two flat device buffers shaped
+//   [batch, max_len, NUM_KV_HEADS * HEAD_DIM]
+// for K and V. The K/V projection matmuls write each new token's
+// per-head K and V vectors straight into the next free row of these
+// buffers. Attention then reads the full prefix [0, kv_seq) from the
+// cache instead of recomputing K and V for prior tokens.
 //
-// Layout: per layer, K and V are flat row-major buffers of shape
-// [batch, s_max, NUM_KV_HEADS * HEAD_DIM]. New tokens are written at offset
-// `(b * s_max + len) * NUM_KV_HEADS * HEAD_DIM` by the caller (typically the
-// K/V projection matmul writes directly into the cache slot).
+// Why allocate up to max_len up front: avoids ever resizing or
+// migrating the buffer mid-generation, which would either break the
+// pointers held by the kernels or force a large device-to-device
+// copy. The cost is bounded VRAM: at the project's S_MAX=1024,
+// 32 layers x 1024 rows x (NUM_KV_HEADS * HEAD_DIM = 1024) x 4 bytes
+// x 2 (K and V) = 256 MB at batch=1.
 //
-// Lifetime: allocations happen once per cache; reset() rewinds len
-// without freeing memory.
+// Lifetime: cudaMalloc on construction, cudaFree on destruction.
+// reset() rewinds the logical length without freeing memory so a REPL
+// session can reuse the same cache for back-to-back prompts.
 
 #pragma once
 

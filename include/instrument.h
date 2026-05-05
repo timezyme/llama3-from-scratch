@@ -1,16 +1,19 @@
-// Lightweight instrumentation helpers for diagnosing where time and
-// memory go inside the forward pass. Header-only, no .cu unit.
+// Lightweight scope-based timing and VRAM telemetry.
 //
-// Usage:
+// Header-only — drops into any .cu/.cpp without adding a separate
+// translation unit. Used to answer "where does time go in the forward
+// pass?" without the overhead of attaching nvprof/Nsight every run.
+//
+// Usage pattern:
 //   {
-//       Stopwatch sw("layer.load");
+//       Stopwatch sw("layer.load");           // start timer
 //       weights.load_layer(layer);
-//   }   // prints elapsed ms when scope ends, accumulates into named bucket
+//   }                                          // dtor accumulates elapsed ms
 //   ...
-//   Stopwatch::print_summary();  // dump per-name aggregates
+//   Stopwatch::print_summary();                // print per-name min/avg/max
 //
 // VRAM probe:
-//   probe_vram("startup");       // logs free/total VRAM with a label
+//   probe_vram("startup");                     // free/total VRAM at this point
 
 #pragma once
 

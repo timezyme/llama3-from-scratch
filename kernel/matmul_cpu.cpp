@@ -1,26 +1,30 @@
-// CPU fallback for matrix multiply C[M,N] = A[M,K] * B[K,N].
-// Used when nvcc is not available (no GPU build).
-// Implements the same gpu_matmul interface so the rest of the codebase
-// links transparently against either the CUDA or CPU version.
+// CPU fallback for the matmul kernel, used when the project is built
+// without nvcc. It exists so headers/tests still link without CUDA — the
+// inference binary itself refuses to run on a CPU-only build (see
+// main.cpp). The signature matches gpu_matmul exactly so callers don't
+// have to know which backend is compiled in.
 
 #include "kernel/kernels.cuh"
 
 #include <stdexcept>
 
-// CPU builds cannot use device pointers. Fail clearly at runtime.
+// Device pointers are meaningless on a CPU build. Throw rather than
+// silently dereferencing them.
 void gpu_matmul_device(const float *, const float *, float *,
                        int, int, int) {
     throw std::runtime_error("gpu_matmul_device requires CUDA (nvcc build)");
 }
 
+// CPU GEMM: C[M,N] = A[M,K] * B[K,N], all row-major.
 void gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
     if (M < 0 || K < 0 || N < 0) {
         throw std::runtime_error("gpu_matmul expects non-negative dimensions");
     }
 
-    // Uses i-k-j loop order (instead of the naive i-j-k) so the innermost
-    // loop streams sequentially through both C[i,:] and B[k,:], giving
-    // good cache locality on row-major data.
+    // i-k-j loop order (not the textbook i-j-k). Why: the innermost loop
+    // walks `j` consecutively, which streams sequentially through both
+    // C[i, :] and B[k, :] — both row-major contiguous. The naive i-j-k
+    // would walk B by column, missing the cache on every inner iteration.
     for (int i = 0; i < M; ++i) {
         float *c_row = &C[i * N]; // pointer to output row i
         for (int j = 0; j < N; ++j) {

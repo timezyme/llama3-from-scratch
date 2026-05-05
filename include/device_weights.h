@@ -1,7 +1,8 @@
-// Device-resident BF16 model weights for the L4 optimization path.
+// Always-on-GPU BF16 weights for the L4 inference path.
 //
-// This does not replace ModelWeights yet. It is the resident-weight owner used
-// by the next inference path once parity is proven.
+// Counterpart to ModelWeights but lives in VRAM (video RAM). Per-layer
+// projection weights stay as raw BF16 bits, and matmul widens to FP32.
+// Host ModelWeights still owns embeddings, final norm, and lm_head.
 
 #pragma once
 

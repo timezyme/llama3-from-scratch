@@ -1,6 +1,17 @@
 // BPE (Byte Pair Encoding) tokenizer for Llama 3.
-// Loads a vocabulary file of base64-encoded tokens with ranks,
-// builds lookup tables, and supports encode/decode with special tokens.
+//
+// Implements Milestone 1 Step 2 (llm_part1 §3.1.1): convert a prompt
+// string into a sequence of integer token IDs. The vocabulary is loaded
+// from `assets/llama3/token.model`, which lists 128000 base-token
+// strings (base64-encoded) plus a rank, followed by 256 reserved
+// special-token slots starting at ID 128000.
+//
+// Encode flow: split the input on special-token boundaries, then BPE
+// merge each plain-text chunk by repeatedly joining the lowest-ranked
+// adjacent pair until no further merge exists in the vocab. Decode
+// is the inverse: concatenate the byte sequences associated with each
+// token ID (skipping special tokens, which are control markers, not
+// printable text).
 
 #include "prelude.h"
 #include "tokenizer.h"
@@ -12,17 +23,29 @@
 #include <fstream>
 #include <stdexcept>
 
-// Encode text to token IDs with BPE merging enabled.
+// Public encode: runs full BPE merging. e.g. "Hello world" -> [9906, 1917].
+//
+// Note: encode() does NOT prepend the BOS (<|begin_of_text|>, ID
+// 128000) token. The M1 grading example in llm_part1 §3.1.1 shows
+// "Hello world" -> [128000, 9906, 1917] WITH BOS — our TestAPI wrapper
+// (tests/test_api.cpp) prepends bos_id() so the grader sees the
+// expected leading 128000. The chat-template wrapper in inference.cu
+// also injects BOS itself. Keeping the bare encode() free of BOS lets
+// callers compose their own prefix.
 vector<int> BPETokenizer::encode(const string &text) const {
     return encode_impl(text, true);
 }
 
-// Encode text to token IDs without BPE merging (byte-level only).
+// Encode without BPE merging — every byte becomes its own token.
+// Useful only for testing the chunk-splitting logic in isolation.
 vector<int> BPETokenizer::encode_no_merge(const string &text) const {
     return encode_impl(text, false);
 }
 
-// Decode token IDs back to a string, skipping special tokens.
+// Decode token IDs back to text. Special tokens (BOS, EOS, headers,
+// etc.) are skipped because they are control markers — emitting their
+// "<|...|>" string forms back to the user would expose the chat
+// template to whoever called us.
 string BPETokenizer::decode(const vector<int> &ids) const {
     string out;
     for (int id : ids) {
@@ -37,14 +60,18 @@ string BPETokenizer::decode(const vector<int> &ids) const {
 int BPETokenizer::bos_id() const { return bos_id_; }
 int BPETokenizer::eos_id() const { return eos_id_; }
 
-// Default constructor is disallowed — must provide a vocab file path.
+// Disallowed default constructor — the tokenizer is meaningless without
+// a vocab file, and silently constructing an empty one would cause
+// confusing test failures later.
 BPETokenizer::BPETokenizer() {
     throw std::runtime_error("BPETokenizer must be initialized with a path");
 }
 
-// Load vocabulary from file.
-// File format: one token per line as "<base64-encoded token> <rank>"
-// Rank doubles as the token ID in the vocabulary.
+// Build the tokenizer from a file produced by tools/gen_token_model.py.
+// File format: one token per line, "<base64-encoded bytes> <rank>". The
+// rank is also the token ID. Special tokens (BOS, EOS, headers, etc.)
+// are not in the file — they are appended programmatically below at
+// IDs 128000..128255 so they sit just above the regular vocab.
 BPETokenizer::BPETokenizer(const string &path) {
     std::ifstream f(path);
     if (!f)
@@ -108,7 +135,9 @@ BPETokenizer::BPETokenizer(const string &path) {
     bos_id_ = special2id.at("<|begin_of_text|>");
     eos_id_ = special2id.at("<|end_of_text|>");
 
-    // Sort special tokens longest-first for greedy longest-match during encoding.
+    // Sort longest-first so encoding does greedy longest-match. Without
+    // this, a substring like "<|end" might match a partial special token
+    // before the full "<|end_of_text|>" gets a chance to.
     for (const auto &kv : special2id)
         specials_sorted.push_back(kv.first);
     std::sort(
@@ -116,8 +145,10 @@ BPETokenizer::BPETokenizer(const string &path) {
         [](const string &a, const string &b) { return a.size() > b.size(); });
 }
 
-// Decode a base64-encoded string to raw bytes.
-// Uses a static lookup table (initialized once) mapping ASCII chars to 6-bit values.
+// Standard RFC 4648 base64 decoder. The vocab file stores each token's
+// raw byte sequence in base64 because the token strings can contain
+// arbitrary bytes (including newlines and non-printable values) that
+// would otherwise corrupt a line-oriented text file.
 string BPETokenizer::b64decode(const string &s) {
     static int T[256];
     static bool init = false;
@@ -154,8 +185,12 @@ string BPETokenizer::b64decode(const string &s) {
     return out;
 }
 
-// Split text at special-token boundaries, then BPE-encode each normal chunk.
-// Special tokens are matched greedily (longest first) and emitted directly.
+// Top-level encode: walk the text left-to-right, peel off any special
+// token at the cursor (longest match first), then BPE-encode the next
+// run of plain text up to the following special token (or end of
+// input). Why split here: the BPE merge loop can only see vocabulary
+// pairs, so feeding it a special token like "<|begin_of_text|>" would
+// cause it to merge those bracket characters into something nonsense.
 vector<int> BPETokenizer::encode_impl(const string &text,
                                       bool enable_merge) const {
     vector<int> ids;
@@ -204,9 +239,25 @@ vector<int> BPETokenizer::encode_impl(const string &text,
     return ids;
 }
 
-// Greedy BPE merge loop for a single text chunk (no special tokens).
-// Starts with one token per byte, then repeatedly merges the adjacent pair
-// with the lowest rank until no more merges are possible.
+// Greedy BPE merge for one plain-text chunk.
+//
+// Algorithm: start with each byte as its own token, then repeatedly
+// scan all adjacent pairs and merge the one whose concatenation has the
+// lowest rank (= earliest learned merge during training). Stop when no
+// pair has a rank in the vocab.
+//
+// Why pick the lowest-rank pair at each step (greedy) instead of
+// searching all possible merge orderings: BPE training produces a
+// fixed merge order — at each step it picked the most-frequent pair
+// and added it. Encode-time MUST replay that same order to be
+// consistent with how the model saw text during training. Lower
+// rank = earlier merge = stronger preference. There is no ambiguity
+// to search over.
+//
+// Complexity is O(n^2) per chunk in the worst case (each merge scans
+// O(n) pairs and reduces length by 1), but Llama 3 chunks rarely
+// exceed a few dozen bytes between special tokens, so this is fine in
+// practice.
 vector<int> BPETokenizer::encode_chunk(const string &s,
                                        bool enable_merge) const {
     // Initialize: each byte becomes its own token.

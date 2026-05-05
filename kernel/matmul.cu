@@ -1,10 +1,11 @@
-// Tiled GEMM kernel for C = A * B (row-major, FP32).
+// Tiled GEMM (general matrix multiply): C = A * B, row-major FP32.
+// Satisfies llm_part1 §3.1.1 Step 5 with block tiling, shared-memory
+// reuse, and coalesced global loads. HBM means high-bandwidth memory.
 //
-// Strategy: double-buffered shared memory tiles with thread coarsening.
-// Each thread block computes a BM x BN tile of C. Each thread within
-// the block computes a TM x TN sub-tile using register-level accumulation.
-// Shared memory uses +1 padding to avoid bank conflicts.
-// Matrix B is loaded with vectorized reads for coalesced global access.
+// Extra choices: double-buffered shared tiles, 8x8 per-thread register
+// accumulation, float4/BF16 vectorized loads, and +1 shared-memory
+// padding to avoid transpose-style bank conflicts. Tensor cores are not
+// used; that would require WMMA or mma.sync intrinsics and stricter tiles.
 
 #include "kernel/kernels.cuh"
 
@@ -16,13 +17,21 @@
 
 namespace {
 
-// Block tile dimensions — each thread block handles a BM x BN region of C,
-// stepping through K in chunks of BK.
+// Block tile dimensions — each thread block owns a BM x BN region of C
+// and walks K in BK-wide tiles. 128x128 was chosen because, during one
+// rank-1 outer-product step, each smA element (at one row, one K-depth)
+// is reused by every output column in the block (BN = 128 reuses), and
+// each smB element is reused by every output row (BM = 128 reuses).
+// BK = 16 keeps two double-buffered shared tiles (smA + smB, including
+// the +1 padding) well under the per-block shared-memory budget on
+// Turing/Ada (~64 KiB default).
 constexpr int BM = 128;   // rows of C per block
 constexpr int BN = 128;   // cols of C per block
-constexpr int BK = 16;    // depth of each tile along K
+constexpr int BK = 16;    // K-depth of each loaded tile
 
-// Thread tile dimensions — each thread computes TM x TN = 64 output elements.
+// Thread tile dimensions — each thread accumulates TM x TN = 64 output
+// elements in registers. 8x8 keeps register pressure tolerable while
+// raising arithmetic intensity (one smA/smB load services 8*8=64 FMAs).
 constexpr int TM = 8;
 constexpr int TN = 8;
 
@@ -50,10 +59,17 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
     throw std::runtime_error(oss.str());
 }
 
+// BF16 (bfloat16) shares FP32's 8-bit exponent, so widening to FP32 is
+// a 16-bit left shift into the high half of a float. __uint_as_float
+// reinterprets those bits on the device.
 __device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
     return __uint_as_float(static_cast<unsigned int>(bits) << 16);
 }
 
+// Load 4 BF16 values from src and widen each to FP32 in dst.
+// One uint2 (8 bytes) is loaded per call, so the compiler can issue an
+// LDG.E.64 — a single coalesced 64-bit transaction per thread — instead
+// of four separate 16-bit loads.
 __device__ __forceinline__ void load_bf16_quad(float *dst,
                                                const uint16_t *src) {
     uint2 packed = *reinterpret_cast<const uint2 *>(src);
@@ -67,13 +83,21 @@ __device__ __forceinline__ void load_bf16_quad(float *dst,
 
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
-// GEMM kernel: C[M,N] = A[M,K] * B[K,N].
-// Each thread computes a TM x TN sub-tile of C using register accumulation.
-// Double buffering: while computing on buffer `cur`, the next tile loads into `nxt`.
+// FP32 GEMM kernel: C[M,N] = A[M,K] * B[K,N], all row-major.
+// Algorithm flow per block: prefetch tile 0, then for each K-tile —
+//   (a) prefetch the next tile into the alternate buffer,
+//   (b) run rank-1 outer-product accumulation on the current tile,
+//   (c) sync and swap buffers so the next iteration computes on what
+//       step (a) just loaded.
+// Each thread holds a private TM*TN register accumulator that sums every
+// K-tile's contribution to its output sub-tile.
 __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
                               int K, int N) {
-    // Double-buffered shared memory with +1 padding to avoid bank conflicts.
-    // Buffer index alternates between 0 and 1 each iteration.
+    // Double-buffered tiles in shared memory. The leading dimension `2`
+    // is the buffer index that ping-pongs between tiles to overlap loads
+    // with compute. The trailing `+1` pads the inner dimension so threads
+    // accessing the same logical column hit different banks during the
+    // outer-product loop (avoids 32-way bank-conflict serialization).
     __shared__ float smA[2][BM][BK + 1];
     __shared__ float smB[2][BK][BN + 1];
 
@@ -89,9 +113,15 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
             acc[i][j] = 0.0f;
 
     // === Prefetch first tile (tile 0) into buffer 0 ===
+    // We do this once before the main loop so iteration 0 already has data
+    // in `cur` to compute on while it prefetches tile 1 into `nxt`.
 
     // Cooperatively load smA: each thread loads 8 scalar elements from A.
-    // Maps flat element index -> (row, col) in the BM x BK shared tile.
+    // smA is BM*BK = 2048 floats; 256 threads * 8 floats = 2048 — every
+    // thread participates so the load is fully parallel and coalesced.
+    // The flat element index `tid + i*NUM_THREADS` strides each thread's
+    // 8 elements across the tile so consecutive lanes touch consecutive
+    // global addresses.
     #pragma unroll
     for (int i = 0; i < SMA_LOADS_PER_THREAD; ++i) {
         int elem = tid + i * NUM_THREADS;
@@ -103,7 +133,8 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     }
 
     // Cooperatively load smB: each thread loads 2 float4s (8 floats) from B.
-    // float4 loads give coalesced 128-bit global memory access.
+    // Use 128-bit vector reads when aligned and in bounds; edge tiles fall
+    // back to scalar loads.
     #pragma unroll
     for (int i = 0; i < SMB_F4_PER_THREAD; ++i) {
         int f4 = tid + i * NUM_THREADS;
@@ -131,10 +162,16 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     __syncthreads();
 
     // === Main loop: iterate over K-tiles with double buffering ===
-    // On each iteration we:
-    //   1. Prefetch the NEXT tile into the alternate shared memory buffer (overlap with compute)
-    //   2. Compute the outer-product accumulation on the CURRENT tile
-    //   3. Sync and swap buffers
+    // Each iteration:
+    //   1. Prefetch the NEXT tile into the alternate buffer `nxt`. This
+    //      overlaps HBM loads with FMA (fused multiply-add) work on the
+    //      current tile on the SM (streaming multiprocessor).
+    //   2. Compute on the CURRENT tile in `cur`. This is where the work
+    //      actually happens — register-level outer products that produce
+    //      TM*TN partial sums per thread.
+    //   3. __syncthreads() to make sure every thread has finished reading
+    //      `cur` before we reuse that buffer in a future iteration. Then
+    //      swap so next iteration's compute sees what step 1 just loaded.
 
     int cur = 0; // current buffer index (0 or 1)
     for (int tile = 0; tile < num_tiles; ++tile) {
@@ -183,8 +220,11 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
         }
 
         // --- Compute on current tile: rank-1 outer product accumulation ---
-        // For each k in [0, BK): load a column of smA and a row of smB into
-        // registers, then accumulate TM x TN FMAs into acc[][].
+        // For each k in [0, BK): pull this thread's TM rows of smA at depth
+        // k into registers (a_reg) and its TN cols of smB at depth k into
+        // registers (b_reg), then run a TM*TN FMA grid. This is the core
+        // arithmetic-intensity boost: BK=16 sweeps produce 16*64 = 1024
+        // FMAs per thread, all sourced from registers.
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
             // This thread's TM values from its rows of smA (column k).
@@ -228,10 +268,10 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     }
 }
 
-// GEMM with FP32 activations and BF16-packed weights:
-// C[M,N] = A[M,K] * B_bf16[K,N].
-// This mirrors matmul_kernel's tiling so downstream code can swap only the
-// weight representation before moving to tensor-core kernels.
+// FP32 activations * BF16 weights: C[M,N] = A[M,K] * B_bf16[K,N].
+// Same tiling as matmul_kernel, but smB is loaded by widening BF16 bits
+// to FP32 inline. Keeping resident weights in BF16 halves weight bytes
+// read from HBM; accumulation remains FP32.
 __global__ void matmul_bf16_weight_kernel(const float *A,
                                           const uint16_t *B_bf16,
                                           float *C, int M, int K, int N) {
@@ -363,9 +403,11 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
     }
 }
 
-// Host-side entry point: allocates device memory, copies A and B to GPU,
-// launches the kernel, copies C back, and frees device memory.
-// Exception-safe: device memory is freed on both success and error paths.
+// Host entry used by the M1 grading tests (TestAPI::matmul).
+// Owns the full host->device->host trip: cudaMalloc, copy A and B in,
+// launch the kernel, copy C out, free everything. Exception-safe:
+// device buffers are freed on every path so a CUDA error mid-call does
+// not leak GPU memory.
 void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
                 int N) {
     if (M < 0 || K < 0 || N < 0) {
@@ -439,9 +481,10 @@ void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
     CUDA_CHECK(free_all());
 }
 
-// Device-pointer entry point: launches the same tiled GEMM kernel
-// but expects all pointers to already reside in device memory.
-// No host-device copies are performed. Caller manages allocation and lifetime.
+// Device-pointer entry used inside the forward pass. Skips the H2D/D2H
+// copies because the inference pipeline already has Q, K, V, X, etc. in
+// VRAM (video RAM) — every redundant copy would be wasted PCIe (Peripheral
+// Component Interconnect Express) bandwidth. Caller owns the d_* buffers.
 void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
                        int M, int K, int N) {
     if (M < 0 || K < 0 || N < 0) {
@@ -460,6 +503,9 @@ void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// Same device-pointer entry as gpu_matmul_device but for the BF16-weight
+// kernel. Used for every per-layer projection (Q/K/V/O/gate/up/down) in
+// the resident-weights inference path so weight bytes stay BF16 in VRAM.
 void gpu_matmul_device_bf16_weight(const float *d_A,
                                    const uint16_t *d_B_bf16,
                                    float *d_C, int M, int K, int N) {

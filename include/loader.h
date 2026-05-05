@@ -1,6 +1,9 @@
-// Binary weight loader for Llama 3 model dumps.
-// Reads files produced by tools/dumper.py (safetensors -> 280-byte header + payload).
-// Supports FP32, FP16, and BF16 payloads, converting all values to FP32 on load.
+// Low-level loader for the binary weight dumps produced by
+// tools/dumper.py. ModelWeights and DeviceModelWeights both build on
+// top of this; the rest of the codebase shouldn't reach for it
+// directly. Supports the three payload dtypes the dumper can emit
+// (FP32, FP16, BF16) — Llama 3 was trained in BF16 so that's the
+// usual choice. See src/loader.cpp for the 280-byte header layout.
 
 #pragma once
 #include "prelude.h"

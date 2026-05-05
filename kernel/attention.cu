@@ -1,11 +1,27 @@
-// Attention helper kernels for Llama 3 GQA attention.
+// Attention building-block kernels for Llama 3's Grouped Query Attention
+// (GQA). GEMM means general matrix multiply. Each piece is separate so
+// inference.cu can compose the llm_part2 §3.1 attention flow per head:
 //
-// Provides:
-// - Causal mask application (add -1e6 to upper triangle)
-// - Numerically stable softmax (max subtraction before exp)
-// - Scale kernel (multiply by 1/sqrt(h_d))
-// - Per-head strided gather/scatter (used to slice a single head out of
-//   the row-major [seq, num_heads * head_dim] layout without leaving the GPU)
+//   gather Q_i (and K_g transposed, V_g) -> matmul(Q_i, K_g^T) -> scale
+//   -> causal_mask -> softmax -> matmul(softmax, V_g) -> scatter back
+//
+// The four numerically/architecturally important pieces — and the
+// llm_part2 §4 pitfalls they avoid:
+//
+//   - SCALE by 1/sqrt(h_d) before softmax. Without scaling, dot products
+//     grow as O(sqrt(h_d)) and push softmax into the saturated regime.
+//   - CAUSAL MASK on every (p,q) with q>p across the full s*s score
+//     matrix, not just the diagonal or last row. We add -1e6 (a large
+//     negative finite value) instead of -inf so a downstream NaN from
+//     0*inf can't sneak in if a row is entirely masked.
+//   - NUMERICALLY STABLE SOFTMAX: subtract the per-row max before
+//     exp(). Skipping this step makes exp() overflow on even modestly
+//     large scores; the assignment marks this as non-optional.
+//   - GATHER/SCATTER kernels stay on the GPU — they slice and write
+//     individual heads out of the packed [s, h * h_d] layout without
+//     ever copying to host. The transposed gather variant produces a
+//     row-major K^T so the score-matrix matmul Q_i * K_g^T can use the
+//     standard tiled GEMM kernel directly.
 
 #include "kernel/kernels.cuh"
 
@@ -28,7 +44,8 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
 
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
-// Scale every element of a matrix by a constant factor.
+// Scale every element by a constant. Used to apply the 1/sqrt(h_d)
+// factor to the raw QK^T scores before the causal mask and softmax.
 __global__ void scale_kernel(float *__restrict__ data, int count,
                              float scale) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,8 +54,17 @@ __global__ void scale_kernel(float *__restrict__ data, int count,
     }
 }
 
-// Apply causal mask to a score matrix S[s, s].
-// For each (row, col) where col > row, set S[row, col] = -1e6.
+// Causal mask for a square score matrix S[s, s]: for every (row, col)
+// with col > row, write -1e6. After softmax those positions become
+// effectively zero, so each query at position p only attends to itself
+// and earlier tokens (the causal autoregressive constraint from
+// llm_part2 §3.1).
+//
+// Why -1e6 instead of -inf: llm_part2 §3.2 explicitly suggests "add a
+// large negative value such as -10^6 (acting as -inf) to all positions
+// where q>p, then proceed with softmax normally." A finite sentinel
+// also keeps downstream ops safe — if a row were ever fully masked,
+// exp(-inf)=0 and 0/0 inside softmax would produce NaN.
 __global__ void causal_mask_kernel(float *__restrict__ S, int s) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= s * s) return;
@@ -49,9 +75,19 @@ __global__ void causal_mask_kernel(float *__restrict__ S, int s) {
     }
 }
 
-// Numerically stable softmax over each row of a matrix.
-// For each row: subtract max, exponentiate, normalize.
-// One block per row, shared memory for reductions.
+// Numerically stable softmax, in place, one block per row.
+//
+// Three-pass design (matches the order required by llm_part2 §4):
+//   1. Find the row maximum via tree reduction in shared memory.
+//   2. Exponentiate (val - row_max) — max-subtraction prevents the
+//      overflow that the assignment explicitly warns about. Without it,
+//      exp(score) is `inf` for moderately large scores and the kernel
+//      silently produces NaN logits.
+//   3. Reduce the exponentiated row to a sum, then normalize.
+//
+// Mathematically equivalent to the naive exp(S)/sum(exp(S)) because
+// subtracting a constant from every element of softmax leaves the
+// result unchanged.
 __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
@@ -59,7 +95,7 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     float *row_data = data + row * cols;
     extern __shared__ float sdata[];
 
-    // Pass 1: find row maximum
+    // Pass 1: find row maximum.
     float thread_max = -1e30f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float val = row_data[i];
@@ -68,6 +104,7 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     sdata[threadIdx.x] = thread_max;
     __syncthreads();
 
+    // Tree reduction: pairwise max-merge halves the active threads each step.
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             if (sdata[threadIdx.x + stride] > sdata[threadIdx.x]) {
@@ -78,7 +115,8 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     }
     float row_max = sdata[0];
 
-    // Pass 2: exponentiate (with max subtraction) and sum
+    // Pass 2: exponentiate after subtracting row_max. Each thread also
+    // accumulates a partial sum to feed the next reduction.
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float val = expf(row_data[i] - row_max);
@@ -88,6 +126,7 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     sdata[threadIdx.x] = thread_sum;
     __syncthreads();
 
+    // Tree reduction: pairwise sum-merge to produce the row total.
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             sdata[threadIdx.x] += sdata[threadIdx.x + stride];
@@ -96,14 +135,18 @@ __global__ void softmax_kernel(float *__restrict__ data, int rows, int cols) {
     }
     float row_sum = sdata[0];
 
-    // Pass 3: normalize
+    // Pass 3: divide every element by the row sum. After this pass each
+    // row is a valid probability distribution that sums to 1.
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         row_data[i] /= row_sum;
     }
 }
 
-// Strided gather of a single head's [rows, head_dim] slice out of a packed
-// [rows, src_stride] tensor. dst[r, c] = src[r, head_offset + c].
+// Slice one head out of a packed Q (or V) tensor. The full Q is laid out
+// row-major as [rows, num_heads * head_dim]; this gather copies the
+// head_dim-wide column slab starting at `head_offset` for every row,
+// producing a contiguous [rows, head_dim] tensor that the per-head
+// matmul can consume directly without any pointer arithmetic gymnastics.
 __global__ void gather_head_kernel(const float *__restrict__ src,
                                    float *__restrict__ dst, int rows,
                                    int head_dim, int src_stride,
@@ -116,11 +159,16 @@ __global__ void gather_head_kernel(const float *__restrict__ src,
     dst[r * head_dim + c] = src[r * src_stride + head_offset + c];
 }
 
-// Same gather but transposes from [rows, head_dim] to [head_dim, rows], so
-// downstream matmul can consume a row-major K^T with shape [HEAD_DIM, kv_seq].
-// Tiled with shared memory so both src loads (consecutive c) and dst stores
-// (consecutive r) are coalesced; the +1 padding on the inner tile dim avoids
-// shared-memory bank conflicts during the transpose.
+// Same gather but materializes K^T (transpose) on the way out: it reads
+// K's [rows, head_dim] slice and writes [head_dim, rows]. This gives the
+// score GEMM Q_i * K_g^T contiguous row-major inputs without a separate
+// transposed-B matmul kernel.
+//
+// Tiled with shared memory: both the source loads (consecutive `c`) and
+// the destination stores (consecutive `r` on the transposed side) are
+// coalesced. The +1 column padding on the shared tile staggers the
+// store addresses so threads in a warp hit different banks (bank
+// conflicts during transpose are otherwise the bottleneck).
 constexpr int GATHER_T_TILE = 32;
 __global__ void gather_head_transpose_kernel(const float *__restrict__ src,
                                              float *__restrict__ dst, int rows,
@@ -143,8 +191,11 @@ __global__ void gather_head_transpose_kernel(const float *__restrict__ src,
     }
 }
 
-// Inverse of gather_head_kernel: write a [rows, head_dim] head back into
-// dst[r, head_offset + c] inside a [rows, dst_stride] packed tensor.
+// Inverse of gather_head_kernel: place a per-head [rows, head_dim]
+// result back into the packed [rows, dst_stride] output tensor at
+// `head_offset`. After all 32 heads are scattered, the packed tensor
+// holds the concatenated O = concat(O_0, ..., O_{h-1}) ready for the
+// output projection W_O.
 __global__ void scatter_head_kernel(const float *__restrict__ src,
                                     float *__restrict__ dst, int rows,
                                     int head_dim, int dst_stride,

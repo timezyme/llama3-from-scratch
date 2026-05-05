@@ -1,9 +1,19 @@
-// SwiGLU CUDA kernel for Llama 3 FFN.
+// SwiGLU activation for the Llama 3 FFN (feed-forward network).
 //
-// Formula: output[i] = SiLU(gate[i]) * up[i]
-//          SiLU(x) = x / (1 + exp(-x))
+// The full FFN is:
+//   gate = X_norm @ W_gate^T            (matmul; in [s, d_ff])
+//   up   = X_norm @ W_up^T              (matmul; in [s, d_ff])
+//   H    = SiLU(gate) * up              <-- this kernel, elementwise
+//   ffn_out = H @ W_down^T              (matmul; in [s, d])
 //
-// One thread per element. d_output may alias d_gate.
+// SiLU (Sigmoid Linear Unit, also called swish): SiLU(x) = x * sigmoid(x)
+//   = x / (1 + exp(-x)). llm_part2 §3.2 requires this elementwise
+// activation between the gate/up projections and W_down.
+//
+// One thread per output element — fully data-parallel, no reductions or
+// shared memory needed. d_output is allowed to alias d_gate so the
+// caller can fuse this into the gate buffer in place (saves one VRAM
+// allocation in the forward pass).
 
 #include "kernel/kernels.cuh"
 

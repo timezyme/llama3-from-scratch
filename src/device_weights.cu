@@ -1,3 +1,13 @@
+// Resident (always-on-GPU) BF16 weights for the L4 inference path.
+//
+// The streaming path moves each layer disk -> CPU RAM -> PCIe -> VRAM
+// (video RAM) on every forward step. This path instead uploads once and
+// reuses resident layer weights across decode steps.
+//
+// We transpose during load, matching model_weights.cpp: checkpoint
+// [out, in] becomes [in, out] in VRAM. The only runtime difference from
+// the FP32 streaming path is the BF16-weight matmul variant.
+
 #include "device_weights.h"
 
 #include <cuda_runtime.h>
@@ -21,6 +31,9 @@ void check_cuda(cudaError_t err, const char *expr, const char *file, int line) {
 
 #define CUDA_CHECK(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
+// Allocate `count * sizeof(T)` bytes of VRAM and return the pointer.
+// Throws on failure (the CUDA_CHECK macro converts cudaError into a
+// runtime_error so callers get a single exception path).
 template <typename T>
 T *device_alloc(size_t count) {
     T *ptr = nullptr;
@@ -28,6 +41,10 @@ T *device_alloc(size_t count) {
     return ptr;
 }
 
+// Transpose a row-major BF16 matrix on the host before uploading to
+// VRAM. We bake the transpose in here so the resident-VRAM path uses
+// the same [in, out] convention as the streaming path — the kernel
+// code never has to special-case which weight layout it sees.
 std::vector<uint16_t> transpose_bf16(const std::vector<uint16_t> &src,
                                      size_t rows, size_t cols) {
     std::vector<uint16_t> dst(rows * cols);
@@ -64,6 +81,10 @@ DeviceModelWeights::~DeviceModelWeights() {
     }
 }
 
+// Load and upload one decoder layer's tensors into VRAM. Idempotent:
+// returns the cached struct if already loaded. Throws (and frees
+// whatever has been allocated for this layer) on any failure to
+// avoid leaving partially-allocated layers behind.
 const DeviceLayerWeights &DeviceModelWeights::load_layer(int layer_idx) {
     if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {
         throw std::runtime_error("DeviceModelWeights: layer index out of range");
@@ -124,6 +145,8 @@ const DeviceLayerWeights &DeviceModelWeights::load_layer(int layer_idx) {
     return lw;
 }
 
+// Pre-load every decoder layer. Called once at process startup so the
+// generation loop never has to upload weights mid-stream.
 void DeviceModelWeights::load_all_layers() {
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         load_layer(layer);
@@ -190,6 +213,9 @@ void DeviceModelWeights::free_layer(int layer_idx) {
     layer_loaded_[layer_idx] = false;
 }
 
+// Read a BF16 dump as raw uint16 bits, transpose on the host, and
+// upload to VRAM. The whole pipeline stays in BF16 — no FP32 detour —
+// so the host RAM peak is roughly half what the FP32 path would use.
 uint16_t *DeviceModelWeights::load_bf16_transposed(
     const std::string &path, size_t rows, size_t cols, size_t &bytes) {
     auto raw = loader_.load_2d_bf16_raw(path, rows, cols);
@@ -201,6 +227,9 @@ uint16_t *DeviceModelWeights::load_bf16_transposed(
     return device;
 }
 
+// Load a 1D tensor as FP32 (no transpose, no widening from BF16).
+// Used for the per-layer RMSNorm gammas — they are small and stay in
+// FP32 throughout for simpler RMSNorm kernel arithmetic.
 float *DeviceModelWeights::load_fp32_1d_device(const std::string &path,
                                                size_t dim, size_t &bytes) {
     std::unique_ptr<float[]> host(loader_.load_1d(path, dim));

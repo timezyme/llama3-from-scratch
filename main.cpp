@@ -1,20 +1,21 @@
-// Llama 3 8B inference CLI.
+// Llama 3 8B Instruct inference CLI.
 //
-// Steps:
-//   1. Parse the command line into a max-tokens count plus either a list of
-//      prompts or the --interactive flag.
-//   2. In interactive mode, load the weights once and answer prompts read
-//      from stdin until the user exits.
-//   3. Otherwise pick the cheapest forward-pass shape for what was asked:
-//      a single greedy token, a multi-token KV-cached decode, or a batched
-//      decode that advances several prompts in lockstep.
-//   4. Run that forward pass, decode the resulting token IDs back to text,
-//      and print the completion.
+// Argument-parsing and dispatch only — all the heavy lifting lives in
+// inference.cu. The CLI's job is to:
 //
-// Usage: ./bin/llm "prompt"                  (single greedy token)
-//        ./bin/llm --max-tokens N "prompt"   (N tokens, KV-cached decode)
-//        ./bin/llm --prompt "p1" --prompt "p2" --max-tokens N
-//        ./bin/llm --interactive [--max-tokens N]
+//   1. Parse argv into (max_tokens, prompts, interactive flag).
+//   2. Pick one of four execution paths based on what was asked:
+//        a) interactive: REPL with resident weights (warmup once).
+//        b) one prompt + max_tokens=1: cheapest path; single greedy token.
+//        c) one prompt + max_tokens>1: KV-cached decode loop.
+//        d) many prompts: batched decode in lockstep.
+//   3. Detokenize the generated IDs and print the completion.
+//
+// Usage:
+//   ./bin/llm "prompt"                              (single greedy token)
+//   ./bin/llm --max-tokens N "prompt"               (N tokens, KV cache)
+//   ./bin/llm --prompt "p1" --prompt "p2" --max-tokens N    (B>1 batch)
+//   ./bin/llm --interactive [--max-tokens N]        (REPL on stdin)
 
 #include "config.h"
 #include "tokenizer.h"
@@ -30,6 +31,7 @@
 
 namespace {
 
+// Print CLI usage text to stderr. Called for `--help` and on argument errors.
 void print_usage(const char *argv0) {
     std::fprintf(stderr,
                  "Usage: %s [--max-tokens N] \"prompt\"\n"
@@ -97,10 +99,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // REPL mode: load weights into GPU memory once, then answer prompts in a
-    // loop. The first call ("warmup") pays the ~165s cost of copying the BF16
-    // weights to the GPU and priming caches; every prompt after that reuses
-    // the resident weights and starts generating immediately.
+    // REPL mode: load BF16 weights into GPU memory once, then answer prompts
+    // in a loop. The warmup pays the upload cost; later prompts reuse the
+    // resident weights.
     if (interactive) {
         if (!prompts.empty() || !positional_prompts.empty()) {
             std::fprintf(stderr,

@@ -1,5 +1,17 @@
-// Kernel declarations for GPU operators (matmul, RMSNorm, etc.).
-// Provides host-callable entry points that launch CUDA kernels internally.
+// Public host API for every GPU operator used by the inference pipeline.
+//
+// The pattern is: each kernel lives in its own .cu file with a launch
+// helper named `gpu_<op>` that the C++ controller calls. The helper
+// takes care of grid/block sizing, error checking, and (for the
+// host-pointer variant) any host<->device copies. The controller in
+// inference.cu therefore stays in plain C++ and never has to write a
+// triple-chevron launch directly.
+//
+// Two variants per matmul:
+//   gpu_matmul        — host pointers (used by the M1 grading test)
+//   gpu_matmul_device — device pointers (used inside the forward pass)
+// Plus gpu_matmul_device_bf16_weight which keeps weights as BF16 in
+// VRAM and only widens to FP32 inside the kernel.
 
 #pragma once
 

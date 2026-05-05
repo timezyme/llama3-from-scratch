@@ -1,5 +1,12 @@
-// Converters for reduced-precision floating-point formats (BF16, FP16) to FP32.
-// Used by the weight loader to decode model dumps stored in half-precision.
+// Half-precision -> FP32 converters used by the weight loader.
+//
+// Llama 3 weights are stored in BF16 (bfloat16) — same 8-bit exponent
+// as FP32 but only 7 mantissa bits. Some auxiliary tensors may be
+// FP16 (the IEEE-754 binary16 format with 5-bit exponent and 10-bit
+// mantissa). Both functions here are pure C++ (no CUDA dependency)
+// because conversion happens on the host before tensors ever reach
+// the GPU. The matmul kernel handles a separate device-side BF16
+// path for resident weights.
 
 #pragma once
 #include <cstdint>

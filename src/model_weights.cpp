@@ -1,7 +1,19 @@
-// Model weight loading for Llama 3 8B.
-// Reads binary dump files, validates shapes, and transposes 2D weights
-// so that the runtime matmul path always consumes contiguous row-major
-// matrices without additional transpose.
+// Per-layer host-side weight management for Llama 3 8B.
+//
+// Wraps LlamaDumpLoader with the model's specific layer/tensor
+// inventory. The big trick: every 2D projection weight in the dump is
+// stored in HuggingFace shape [out_features, in_features], which is the
+// transpose of what our matmul wants. We transpose ONCE at load time
+// (in CPU memory) so the runtime path can always call
+// gpu_matmul(X, W, C, s, in, out) without an extra runtime transpose.
+//
+// This is the "Weights are stored transposed in the checkpoint" pitfall
+// from llm_part2 §4 — handled here, so kernel code never has to think
+// about it.
+//
+// Layers can be loaded and unloaded individually so the host RAM
+// footprint stays bounded for the streaming-from-disk inference path
+// (~one layer's worth of weights resident at a time).
 
 #include "model_weights.h"
 
@@ -26,27 +38,47 @@ ModelWeights::~ModelWeights() {
     global_.lm_head = nullptr;
 }
 
+// Load the model-wide tensors that don't belong to any single decoder
+// layer: the embedding table, the final RMSNorm gamma, and the lm_head
+// output projection.
+//
+// Llama 3 8B Instruct sets `tie_word_embeddings = false` in its
+// config.json, so lm_head is a separate 128256x4096 tensor (not the
+// embedding table). The Part 2 assignment text says "shared with the
+// embedding table"; that is true for vanilla Llama 3 but NOT for the
+// instruct variant we use, which is why we always load lm_head as its
+// own tensor here.
 void ModelWeights::load_global() {
-    // Load and cache the embedding table for row lookups.
+    // Cache the raw embedding payload; rows are decoded on demand.
     if (!loader_.load_embeddings(dump_dir_ + "/embeddings.bin", EMBEDDING_DIM)) {
         throw std::runtime_error("failed to load embeddings from " + dump_dir_);
     }
 
-    // Load the final RMSNorm weight.
+    // model.norm.weight (gamma for the final RMSNorm before lm_head).
     global_.final_norm =
         loader_.load_1d(dump_dir_ + "/global/model_norm_weight.bin",
                         EMBEDDING_DIM);
 
-    // Load the lm_head output projection (NOT tied to embeddings in Llama 3 Instruct).
+    // lm_head.weight as [V, d]. Stored row-major so logits = lm_head @ x_last.
     global_.lm_head =
         loader_.load_2d(dump_dir_ + "/global/lm_head_weight.bin",
                         VOCAB_SIZE, EMBEDDING_DIM);
 }
 
+// Single-prompt embedding lookup — thin pass-through to the loader.
 float *ModelWeights::get_embeddings(const std::vector<int> &token_ids) {
     return loader_.get_embeddings(token_ids);
 }
 
+// Batched embedding lookup for B>1 inference. Output is a flat
+// [batch, s_max, d] tensor where shorter prompts are zero-padded at
+// the END (after their valid tokens). out_lens reports the original
+// per-prompt length so callers can ignore padding when reading
+// last-token logits. out_smax is the longest prompt length seen.
+//
+// Note: this function supports unequal-length batches at the embedding
+// layer, but the rest of the inference path currently requires equal
+// lengths (validate_equal_lengths in inference.cu enforces that).
 float *ModelWeights::get_embeddings_batched(
     const std::vector<std::vector<int>> &batched_ids,
     std::vector<int> &out_lens, int &out_smax) {
@@ -82,6 +114,10 @@ float *ModelWeights::get_embeddings_batched(
     return stacked.release();
 }
 
+// Load all 9 tensors for a single decoder layer (2 RMSNorm gammas, 4
+// attention projections, 3 FFN projections). Idempotent: if the layer
+// was already loaded, returns the cached struct. Each 2D weight is
+// transposed in CPU memory so the caller's matmul never has to.
 const LayerWeights &ModelWeights::load_layer(int layer_idx) {
     if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {
         throw std::runtime_error("layer index out of range");
@@ -164,6 +200,10 @@ const LayerWeights &ModelWeights::load_layer(int layer_idx) {
     return layers_[layer_idx];
 }
 
+// Drop all CPU buffers for one layer's tensors, freeing host RAM.
+// Used by the streaming inference path: load layer N -> upload to GPU
+// -> free CPU copy before loading layer N+1, so peak host RAM stays
+// bounded by one layer's worth of weights (~448 MB at FP32).
 void ModelWeights::unload_layer(int layer_idx) {
     if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {
         return;
@@ -175,11 +215,15 @@ void ModelWeights::unload_layer(int layer_idx) {
     layer_loaded_[layer_idx] = false;
 }
 
+// Build the path to a per-layer tensor's dump file.
+// Layout produced by tools/dumper.py:
+//   dump_dir/layer_XX/model_layers_X_<tensor>.bin
+// where the directory uses a zero-padded 2-digit index (layer_00..31)
+// and the filename uses a non-padded index (model_layers_0..31_).
+// The asymmetry mirrors HuggingFace's safetensors-shard naming so the
+// dumper script doesn't have to remap indices.
 std::string ModelWeights::layer_path(int layer_idx,
                                      const std::string &tensor_name) const {
-    // Dump layout: dump_dir/layer_XX/model_layers_X_<tensor>.bin
-    // Directory uses zero-padded 2-digit index (layer_00, layer_01, ...)
-    // Filename uses non-padded index (model_layers_0_, model_layers_1_, ...)
     std::ostringstream dir;
     dir << dump_dir_ << "/layer_";
     if (layer_idx < 10) dir << "0";
@@ -191,6 +235,11 @@ std::string ModelWeights::layer_path(int layer_idx,
     return file.str();
 }
 
+// Transpose a row-major [rows, cols] FP32 matrix into a new
+// [cols, rows] buffer. Heap-allocated; caller owns the result.
+// Used at load time to flip every projection weight from the
+// HuggingFace [out, in] layout to the [in, out] layout our matmul
+// path consumes.
 float *ModelWeights::transpose(const float *src, size_t rows, size_t cols) {
     float *dst = new float[rows * cols];
     for (size_t r = 0; r < rows; ++r) {

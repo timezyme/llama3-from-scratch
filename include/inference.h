@@ -1,6 +1,19 @@
-// Inference pipeline for Llama 3 8B.
-// Provides the shared forward-pass entry points used by both
-// the CLI executable and the internal test binary.
+// Public inference API for Llama 3 8B Instruct.
+//
+// Three forward-pass shapes are exposed, picked based on what the
+// caller is doing:
+//
+//   - generate_next_token: one prompt, one greedy token. The cheapest
+//     path; used by the M2-3 grading tests.
+//   - generate_tokens (single prompt): KV-cached multi-token decode.
+//     Tokenizes the prompt, runs prefill, then loops decode steps until
+//     EOT or max_new_tokens.
+//   - generate_tokens (vector of prompts): B>1 batched generation.
+//     Requires equal-length tokenizations.
+//
+// Each shape has a `_resident` variant that uses BF16 weights kept on
+// the GPU across calls (paid once at startup), so a long REPL session
+// or a multi-prompt batch doesn't re-upload weights every call.
 
 #pragma once
 
@@ -10,10 +23,9 @@
 #include <string>
 #include <vector>
 
-// Run one forward pass: prompt -> next token ID.
+// Run one prefill pass: prompt -> next token ID.
 // Tokenizes the prompt, runs all 32 decoder layers, applies the output
-// layer, and returns the argmax token ID. No KV cache; full sequence
-// is recomputed each call.
+// layer, and returns the argmax token ID.
 int generate_next_token(ModelWeights &weights, const std::string &prompt);
 
 // Multi-token autoregressive generation using a KV cache.
@@ -39,9 +51,12 @@ std::vector<std::vector<int>> generate_tokens_resident(
     ModelWeights &weights, DeviceModelWeights &resident_weights,
     const std::vector<std::string> &prompts, int max_new_tokens);
 
+// Returned by the _debug variant for tests that need to compare the
+// final hidden state against reference.py before lm_head reduces it
+// down to a single token ID.
 struct GenerateDebugResult {
-    std::vector<std::vector<int>> tokens;
-    std::vector<float> last_hidden;
+    std::vector<std::vector<int>> tokens;       // generated IDs per batch slot
+    std::vector<float> last_hidden;             // [batch, EMBEDDING_DIM]
 };
 
 GenerateDebugResult generate_tokens_resident_debug(

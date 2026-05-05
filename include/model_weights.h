@@ -1,6 +1,15 @@
-// Model weight management for Llama 3 8B inference.
-// Loads weights from binary dump files, transposes 2D projection weights
-// at load time, and supports layer-by-layer streaming to conserve GPU memory.
+// Host-side weight management for Llama 3 8B (Milestone 1 Step 3).
+//
+// ModelWeights wraps LlamaDumpLoader with the model's specific
+// inventory: 32 layer-local tensor groups (LayerWeights) plus the
+// model-wide pieces (GlobalWeights: embedding payload, final RMSNorm
+// gamma, lm_head). Layers can be loaded and freed individually so the
+// streaming inference path keeps host RAM bounded.
+//
+// All 2D projections are transposed during load_layer (see
+// model_weights.cpp:transpose) to flip from the HuggingFace [out, in]
+// layout to [in, out], so the matmul kernel always computes
+// X @ W (no implicit transpose at runtime).
 
 #pragma once
 

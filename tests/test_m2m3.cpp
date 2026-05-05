@@ -1,12 +1,26 @@
 // Internal test harness for Milestones 2-3.
-// Runs one named test at a time for use during code review.
+//
+// This file is NOT the M1 grading harness (that lives in tests/test.cpp
+// and is read-only). It is our own per-operator/integration test suite
+// covering RMSNorm, RoPE, matmul variants, attention, SwiGLU, the
+// resident weight loader, the KV cache, and end-to-end forward passes.
+// Phases 0-5 roughly mirror the assignment milestones and optional
+// caching/batching checks.
+//
+// Each test is a `static int test_<name>()` function that returns
+// PASS or FAIL and prints a one-line PASS/FAIL banner. The dispatcher
+// at the bottom of the file maps a test name (argv[1]) to its
+// function pointer and forwards the exit code so the test driver
+// (./tools/test_l4.sh) can grep for individual failures.
 //
 // Exit codes:
 //   0 = test passed
 //   2 = invalid usage or unknown test name
 //   3 = test ran but failed
 //
-// Usage: ./bin/tests_m2m3 <test_name>
+// Usage:
+//   ./bin/tests_m2m3 <test_name>     # run one test
+//   ./bin/tests_m2m3 --list          # print every test name and exit
 
 #include "config.h"
 #include "device_weights.h"
@@ -413,14 +427,10 @@ static std::vector<float> load_fixture(const std::string &path, size_t count) {
     return buf;
 }
 
-// Shared output-layer helper: compute logits by projecting x_last through the
-// embedding table (lm_head = tied weights). Scans in batches to avoid a single
-// VOCAB_SIZE * EMBEDDING_DIM allocation.
-// loader: LlamaDumpLoader with embeddings already loaded.
-// h_x_last: [EMBEDDING_DIM] host memory.
-// Returns: [VOCAB_SIZE] logits on host.
-// Compute logits using the lm_head output projection weight [VOCAB_SIZE, EMBEDDING_DIM].
-// logits[v] = dot(lm_head[v, :], h_x_last).
+// Output-layer helper for the actual checkpoint: config.json has
+// tie_word_embeddings=false, so lm_head is a separate [VOCAB_SIZE, d]
+// tensor rather than the embedding table named in llm_part2 §4.
+// logits[v] = dot(lm_head[v, :], x_last).
 static std::vector<float> compute_lm_head_logits(const float *lm_head,
                                                   const float *h_x_last) {
     std::vector<float> logits(VOCAB_SIZE);
@@ -1802,7 +1812,7 @@ static int test_full_forward_hello() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5 Tests: final norm, lm_head, weight sharing, streaming, medium prompt
+// Phase 5 Tests: final norm, lm_head, streaming, KV cache, batching
 // ---------------------------------------------------------------------------
 
 // Proves: final RMSNorm matches golden output from Python fixture.
@@ -1856,8 +1866,8 @@ static int test_final_rmsnorm_fixture() {
     return PASS;
 }
 
-// Proves: the shared lm_head helper projects the correct (last) row, not some
-// other row. Uses synthetic data with deliberately different rows.
+// Proves: the lm_head helper projects the correct last row, not another row.
+// llm_part2 §4 requires last-token-only projection before the vocabulary matmul.
 static int test_lm_head_last_token_only() {
     const int s = 3;
     const int d = EMBEDDING_DIM;
@@ -1872,7 +1882,7 @@ static int test_lm_head_last_token_only() {
     fill_deterministic(h_hidden.data() + d, d, /*seed=*/99);    // row 1
     fill_deterministic(h_hidden.data() + 2 * d, d, /*seed=*/7); // row 2
 
-    // Project row 0 and row 2 through the shared helper
+    // Project row 0 and row 2 through the helper.
     auto logits_row0 = compute_lm_head_logits(weights.global().lm_head,
                                                h_hidden.data());
     auto logits_row2 = compute_lm_head_logits(weights.global().lm_head,
@@ -1911,9 +1921,9 @@ static int test_lm_head_last_token_only() {
     return PASS;
 }
 
-// Proves: the shared lm_head helper uses the same embedding-table weights that
-// get_embeddings() returns. Compares sampled logit entries against manual dot
-// products with embedding rows.
+// Historical test name says "weight sharing", but this checkpoint is untied.
+// The test proves compute_lm_head_logits uses the separate lm_head rows
+// loaded by ModelWeights, matching config.json tie_word_embeddings=false.
 static int test_weight_sharing_check() {
     const int d = EMBEDDING_DIM;
 
@@ -1924,7 +1934,7 @@ static int test_weight_sharing_check() {
     std::vector<float> h_x(d);
     fill_deterministic(h_x.data(), d, /*seed=*/123);
 
-    // Compute full logits via the shared helper
+    // Compute full logits via the lm_head helper.
     auto logits = compute_lm_head_logits(weights.global().lm_head, h_x.data());
 
     // Verify by manually computing dot products against lm_head rows for sampled IDs
@@ -2291,6 +2301,15 @@ static int test_batched_b2_distinct_parity() {
 
 using TestFunc = std::function<int()>;
 
+// Map of test name -> test function. Phases roughly mirror the
+// assignment milestones:
+//   Phase 0: matmul/loader smoke and parity (foundation laid in M1)
+//   Phase 1: RMSNorm + Q/K/V projections (M2)
+//   Phase 2: RoPE, GQA mapping, causal mask, softmax, attention (M3)
+//   Phase 3: residual add, SwiGLU, full decoder block (M3)
+//   Phase 4: end-to-end forward pass for a known-good prompt (M3)
+//   Phase 5: final norm, untied lm_head, layer streaming, KV cache,
+//            B>1 batched parity (M3 plus optional extensions)
 static std::map<std::string, TestFunc> build_registry() {
     std::map<std::string, TestFunc> r;
 
@@ -2352,6 +2371,9 @@ static std::map<std::string, TestFunc> build_registry() {
 // Main
 // ---------------------------------------------------------------------------
 
+// argv[1] = test name (or `--list`). Run exactly one named test and
+// return its exit code. The test driver script iterates through these
+// one at a time so a failure in one test doesn't suppress the others.
 int main(int argc, char *argv[]) {
     auto registry = build_registry();
 

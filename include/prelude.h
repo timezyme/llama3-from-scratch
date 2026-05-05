@@ -1,5 +1,10 @@
-// Common type aliases and STL imports shared across all project headers.
-// Included by nearly every file to avoid repetitive using-declarations.
+// Project-wide using-declarations and type aliases.
+//
+// Pulled into the global namespace deliberately to keep call sites
+// terse (e.g. `vector<int>` instead of `std::vector<int>` everywhere
+// in tokenizer.h, loader.h, etc.). This is acceptable for an
+// application-only project — for a public library we'd keep names
+// fully qualified.
 
 #pragma once
 
