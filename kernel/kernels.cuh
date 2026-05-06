@@ -10,8 +10,8 @@
 // Two variants per matmul:
 //   gpu_matmul        — host pointers (used by the M1 grading test)
 //   gpu_matmul_device — device pointers (used inside the forward pass)
-// Plus gpu_matmul_device_bf16_weight which keeps weights as BF16 in
-// VRAM and only widens to FP32 inside the kernel.
+// Plus gpu_matmul_device_bf16_weight, which keeps weights as BF16 in
+// VRAM (video RAM) and widens to FP32 inside the kernel.
 
 #pragma once
 
@@ -48,18 +48,19 @@ void gpu_matmul_device_bf16_weight(const float *d_A,
                                    float *d_C, int M, int K, int N);
 
 // -----------------------------------------------------------------------
-// RMSNorm: output[r,c] = input[r,c] / RMS(row_r) * gamma[c]
+// RMSNorm (root-mean-square layer normalization):
+// output[r,c] = input[r,c] / RMS(row_r) * gamma[c]
 // RMS(row) = sqrt( mean(row^2) + epsilon )
 // All pointers must be in device memory. One block per row.
 void gpu_rmsnorm(const float *d_input, const float *d_gamma,
                  float *d_output, int rows, int cols, float epsilon);
 
 // -----------------------------------------------------------------------
-// RoPE: apply rotary position embeddings in-place.
+// RoPE (rotary position embedding): apply rotations in-place.
 // x: flat projected tensor [seq_len, num_heads * head_dim], device memory.
 // For batched tensors, seq_len is B*q_seq and q_seq is the per-batch length.
 // cos_table, sin_table: precomputed [q_seq, head_dim/2], device memory.
-// Pairs dimension i with i + head_dim/2 (rotate_full convention).
+// Pairs dimension i with i + head_dim/2, matching Llama 3 rotate_half.
 void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
               int seq_len, int num_heads, int head_dim, int q_seq = -1);
 
@@ -91,7 +92,7 @@ void gpu_scatter_head(const float *d_src, float *d_dst, int rows, int head_dim,
                       int dst_stride, int head_offset);
 
 // -----------------------------------------------------------------------
-// SwiGLU: output[i] = SiLU(gate[i]) * up[i]
+// SwiGLU (Swish-Gated Linear Unit): output[i] = SiLU(gate[i]) * up[i]
 // SiLU(x) = x / (1 + exp(-x))
 // All pointers must be in device memory. d_output may alias d_gate.
 void gpu_swiglu(const float *d_gate, const float *d_up,

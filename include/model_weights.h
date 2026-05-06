@@ -1,15 +1,7 @@
-// Host-side weight management for Llama 3 8B (Milestone 1 Step 3).
-//
-// ModelWeights wraps LlamaDumpLoader with the model's specific
-// inventory: 32 layer-local tensor groups (LayerWeights) plus the
-// model-wide pieces (GlobalWeights: embedding payload, final RMSNorm
-// gamma, lm_head). Layers can be loaded and freed individually so the
-// streaming inference path keeps host RAM bounded.
-//
-// All 2D projections are transposed during load_layer (see
-// model_weights.cpp:transpose) to flip from the HuggingFace [out, in]
-// layout to [in, out], so the matmul kernel always computes
-// X @ W (no implicit transpose at runtime).
+// Host-side weight management for Llama 3 8B (llm_part1 §3.1.1 Step 3).
+// Layers load independently so the streaming path keeps host RAM bounded.
+// All 2D checkpoint weights are [out, in] and are transposed to [in, out]
+// before matmul, covering the llm_part2 §4 transposed-weight pitfall.
 
 #pragma once
 
@@ -30,7 +22,7 @@ struct LayerWeights {
     float *v_proj = nullptr;      // transposed: [4096, 1024]
     float *o_proj = nullptr;      // transposed: [4096, 4096]
 
-    // FFN projections (transposed at load: [in_features, out_features])
+    // FFN (feed-forward network) projections, transposed to [in, out].
     float *gate_proj = nullptr;   // transposed: [4096, 14336]
     float *up_proj = nullptr;     // transposed: [4096, 14336]
     float *down_proj = nullptr;   // transposed: [14336, 4096]

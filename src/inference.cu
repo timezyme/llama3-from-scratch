@@ -1,7 +1,8 @@
 // End-to-end Llama 3 8B Instruct inference (llm_part2 §3.1).
 // Each block runs RMSNorm -> Q/K/V -> RoPE -> GQA -> output projection
 // -> residual -> RMSNorm -> SwiGLU FFN -> residual, repeated for 32 layers.
-// GQA means Grouped Query Attention; FFN means feed-forward network.
+// RMSNorm is root-mean-square layer normalization; RoPE is rotary
+// position embedding; GQA is Grouped Query Attention; FFN is feed-forward.
 //
 // lm_head differs from the assignment pitfall text: llm_part2 §4 says
 // it is tied to embeddings, but assets/llama3/config.json sets
@@ -51,14 +52,13 @@ namespace {
 constexpr int S_MAX = 1024;
 
 // Llama 3 Instruct chat-template special token IDs (taken from the
-// official tokenizer added_tokens). The instruct fine-tune was trained
-// on prompts wrapped in this exact template — a bare "Hello world"
-// prompt produces lower-quality output.
+// official tokenizer added_tokens). The instruct fine-tune expects this
+// wrapper, so raw prompts are normalized through it before inference.
 constexpr int BEGIN_OF_TEXT   = 128000;
 constexpr int START_HEADER    = 128006;
 constexpr int END_HEADER      = 128007;
 constexpr int EOT_ID          = 128009; // <|eot_id|>: end-of-turn sentinel
-constexpr int NEWLINE_NEWLINE = 271;    // BPE token for "\n\n"
+constexpr int NEWLINE_NEWLINE = 271;    // BPE (Byte Pair Encoding) token for "\n\n"
 constexpr int USER_TOKEN      = 882;    // BPE token for "user"
 constexpr int ASSISTANT_TOKEN = 78191;  // BPE token for "assistant"
 
@@ -223,7 +223,7 @@ std::vector<float> compute_lm_head_logits(const float *lm_head,
 //              advance into them by `len_before * (h_d/2)` so this step
 //              sees positions [len_before, len_before+q_seq).
 //   resident_weights  if non-null, bypass the H2D upload and use BF16
-//              tensors that already live in VRAM (the `_resident` paths).
+//              tensors that already live in VRAM (video RAM).
 //   batch      number of independent prompts processed in lockstep.
 //
 // Returns: the final-RMSNormed hidden state for the LAST token in each
@@ -373,8 +373,7 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             // because every row independently produces an output Q row.
             // K and V instead must be written into per-batch cache slices
             // at [b, len_before:len_before+q_seq, :], so we issue one
-            // matmul per batch slot. This is the "v1" layout tradeoff for
-            // TODO #2 batching: simple, correct, and slightly less efficient
+            // matmul per batch slot. This batched v1 layout is less efficient
             // than a strided 3D matmul.
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->q_proj,
@@ -572,7 +571,7 @@ void load_resident_layers(DeviceModelWeights *resident_weights) {
 
 // Verify every prompt in a batch tokenized to the same length. Returns
 // the common length on success. Mixed-length batching is intentionally
-// out of scope for TODO #2; refusing here gives a clear error before
+// out of scope; refusing here gives a clear error before
 // the forward pass shapes go off the rails.
 int validate_equal_lengths(const std::vector<std::vector<int>> &batched_ids,
                            const char *context) {
@@ -584,7 +583,7 @@ int validate_equal_lengths(const std::vector<std::vector<int>> &batched_ids,
         if (static_cast<int>(batched_ids[b].size()) != s) {
             throw std::runtime_error(
                 "batched inference requires equal tokenized prompt lengths "
-                "(mixed-length batching is out of scope for TODO #2)");
+                "(mixed-length batching is not supported)");
         }
     }
     return s;

@@ -99,7 +99,7 @@ void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
 // Build cos/sin tables on the host. Sized [seq_len, h_d/2]; `base` is
 // passed in (always ROPE_BASE = 500000 in this project) so this stays
 // reusable for any RoPE-style model. Called once per inference pass and
-// uploaded to VRAM, after which the device kernel is a pure table read.
+// uploaded to VRAM (video RAM), after which the device kernel is a table read.
 void precompute_rope_table(float *cos_out, float *sin_out,
                            int seq_len, int head_dim, float base) {
     int half_hd = head_dim / 2;

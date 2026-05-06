@@ -15,7 +15,7 @@ void gpu_matmul_device(const float *, const float *, float *,
     throw std::runtime_error("gpu_matmul_device requires CUDA (nvcc build)");
 }
 
-// CPU GEMM: C[M,N] = A[M,K] * B[K,N], all row-major.
+// CPU GEMM (general matrix multiply): C[M,N] = A[M,K] * B[K,N], row-major.
 void gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
     if (M < 0 || K < 0 || N < 0) {
         throw std::runtime_error("gpu_matmul expects non-negative dimensions");

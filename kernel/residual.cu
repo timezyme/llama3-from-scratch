@@ -3,7 +3,7 @@
 // This single kernel implements both residual connections inside every
 // decoder block:
 //   X = X + attn_out          (after the attention sub-block)
-//   X = X + ffn_out           (after the FFN sub-block)
+//   X = X + ffn_out           (after the FFN/feed-forward sub-block)
 // llm_part2 §3.1 requires both residuals; reusing one elementwise
 // kernel for both is the obvious move — the work shape is identical.
 

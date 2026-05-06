@@ -1,4 +1,4 @@
-// Tokenizer interface and BPE implementation for Llama 3.
+// Tokenizer interface and BPE (Byte Pair Encoding) implementation for Llama 3.
 
 #pragma once
 

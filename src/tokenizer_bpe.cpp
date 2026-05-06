@@ -1,17 +1,7 @@
-// BPE (Byte Pair Encoding) tokenizer for Llama 3.
-//
-// Implements Milestone 1 Step 2 (llm_part1 §3.1.1): convert a prompt
-// string into a sequence of integer token IDs. The vocabulary is loaded
-// from `assets/llama3/token.model`, which lists 128000 base-token
-// strings (base64-encoded) plus a rank, followed by 256 reserved
-// special-token slots starting at ID 128000.
-//
-// Encode flow: split the input on special-token boundaries, then BPE
-// merge each plain-text chunk by repeatedly joining the lowest-ranked
-// adjacent pair until no further merge exists in the vocab. Decode
-// is the inverse: concatenate the byte sequences associated with each
-// token ID (skipping special tokens, which are control markers, not
-// printable text).
+// BPE (Byte Pair Encoding) tokenizer for llm_part1 §3.1.1 Step 2.
+// assets/llama3/token.model contains 128000 base-token byte strings
+// plus ranks; this code adds 256 Llama 3 special-token IDs starting at
+// 128000. Decode skips special tokens because they are control markers.
 
 #include "prelude.h"
 #include "tokenizer.h"

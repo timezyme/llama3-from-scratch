@@ -1,4 +1,4 @@
-// Lightweight scope-based timing and VRAM telemetry.
+// Lightweight scope-based timing and VRAM (video RAM) telemetry.
 //
 // Header-only — drops into any .cu/.cpp without adding a separate
 // translation unit. Used to answer "where does time go in the forward

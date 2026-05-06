@@ -234,9 +234,9 @@ float_t *load_dense_tensor_checked(const string &dump_file, size_t dim0,
 }
 
 // Load a BF16-only tensor without widening to FP32. Used by the
-// resident-VRAM path so we keep weights at half precision in GPU
-// memory (cuts weight HBM traffic in half during matmul). Falls back
-// to a clear error if the dump dtype isn't BF16.
+// resident-VRAM path so weights stay half precision in GPU memory.
+// This halves weight HBM (high-bandwidth memory) bytes during matmul.
+// Falls back to a clear error if the dump dtype is not BF16.
 std::vector<uint16_t> load_bf16_raw_tensor_checked(const string &dump_file,
                                                    size_t dim0, size_t dim1,
                                                    bool is_2d) {

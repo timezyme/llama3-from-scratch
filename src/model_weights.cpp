@@ -1,19 +1,8 @@
 // Per-layer host-side weight management for Llama 3 8B.
-//
-// Wraps LlamaDumpLoader with the model's specific layer/tensor
-// inventory. The big trick: every 2D projection weight in the dump is
-// stored in HuggingFace shape [out_features, in_features], which is the
-// transpose of what our matmul wants. We transpose ONCE at load time
-// (in CPU memory) so the runtime path can always call
-// gpu_matmul(X, W, C, s, in, out) without an extra runtime transpose.
-//
-// This is the "Weights are stored transposed in the checkpoint" pitfall
-// from llm_part2 §4 — handled here, so kernel code never has to think
-// about it.
-//
-// Layers can be loaded and unloaded individually so the host RAM
-// footprint stays bounded for the streaming-from-disk inference path
-// (~one layer's worth of weights resident at a time).
+// Checkpoint projection weights are [out_features, in_features], so we
+// transpose once at load time to [in, out]. That makes runtime matmul
+// calls match llm_part2 §4's X * W^T math without an extra kernel.
+// Layers load/unload individually for the streaming inference path.
 
 #include "model_weights.h"
 
@@ -115,7 +104,7 @@ float *ModelWeights::get_embeddings_batched(
 }
 
 // Load all 9 tensors for a single decoder layer (2 RMSNorm gammas, 4
-// attention projections, 3 FFN projections). Idempotent: if the layer
+// attention projections, 3 FFN/feed-forward projections). Idempotent: if the layer
 // was already loaded, returns the cached struct. Each 2D weight is
 // transposed in CPU memory so the caller's matmul never has to.
 const LayerWeights &ModelWeights::load_layer(int layer_idx) {
@@ -200,10 +189,9 @@ const LayerWeights &ModelWeights::load_layer(int layer_idx) {
     return layers_[layer_idx];
 }
 
-// Drop all CPU buffers for one layer's tensors, freeing host RAM.
-// Used by the streaming inference path: load layer N -> upload to GPU
-// -> free CPU copy before loading layer N+1, so peak host RAM stays
-// bounded by one layer's worth of weights (~448 MB at FP32).
+// Drop all CPU buffers for one layer's tensors. The streaming path
+// loads layer N, uploads it to the GPU, frees the CPU copy, then moves
+// to layer N+1.
 void ModelWeights::unload_layer(int layer_idx) {
     if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {
         return;

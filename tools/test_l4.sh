@@ -6,7 +6,7 @@
 #
 # Usage:
 #   ./tools/test_l4.sh             # quick cycle, stop VM at end
-#   ./tools/test_l4.sh --perf      # TODO #1 KV-cache perf/audit lane
+#   ./tools/test_l4.sh --perf      # KV-cache perf/audit lane
 #   ./tools/test_l4.sh --full      # final full regression gate
 #   ./tools/test_l4.sh --clean     # force make clean before build
 #   ./tools/test_l4.sh --no-stop   # leave VM running for follow-up work
@@ -27,7 +27,7 @@ Usage: ./tools/test_l4.sh [--unit|--quick|--perf|--full] [--clean] [--no-stop]
 
   --unit      Build and run only the 7 M1 grading tests.
   --quick     Build and run M1 plus fast M2-3 tests. Default lane.
-  --perf      Build and run the TODO #1 KV-cache performance/audit lane only.
+  --perf      Build and run the KV-cache performance/audit lane only.
   --full      Build and run M1 plus every M2-3 test. Final gate only.
   --clean     Force make clean before building.
   --no-stop   Leave the VM running after the test cycle.
@@ -175,7 +175,7 @@ run_m2m3() {
 
 run_kv_perf() {
     echo
-    echo '=== PERF: TODO #1 KV cache resident 8-token audit ==='
+    echo '=== PERF: KV cache resident 8-token audit ==='
     LOG=build/l4-kv-cache-perf.log
     rm -f \"\$LOG\"
 

@@ -1,4 +1,5 @@
-// SwiGLU activation for the Llama 3 FFN (feed-forward network).
+// SwiGLU (Swish-Gated Linear Unit) activation for the Llama 3
+// FFN (feed-forward network).
 //
 // The full FFN is:
 //   gate = X_norm @ W_gate^T            (matmul; in [s, d_ff])
@@ -12,8 +13,8 @@
 //
 // One thread per output element — fully data-parallel, no reductions or
 // shared memory needed. d_output is allowed to alias d_gate so the
-// caller can fuse this into the gate buffer in place (saves one VRAM
-// allocation in the forward pass).
+// caller can fuse this into the gate buffer in place and avoid one VRAM
+// (video RAM) allocation in the forward pass.
 
 #include "kernel/kernels.cuh"
 

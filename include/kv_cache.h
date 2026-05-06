@@ -12,7 +12,7 @@
 // Why allocate up to max_len up front: avoids ever resizing or
 // migrating the buffer mid-generation, which would either break the
 // pointers held by the kernels or force a large device-to-device
-// copy. The cost is bounded VRAM: at the project's S_MAX=1024,
+// copy. The cost is bounded VRAM (video RAM): at S_MAX=1024,
 // 32 layers x 1024 rows x (NUM_KV_HEADS * HEAD_DIM = 1024) x 4 bytes
 // x 2 (K and V) = 256 MB at batch=1.
 //

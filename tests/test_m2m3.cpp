@@ -2,8 +2,10 @@
 //
 // This file is NOT the M1 grading harness (that lives in tests/test.cpp
 // and is read-only). It is our own per-operator/integration test suite
-// covering RMSNorm, RoPE, matmul variants, attention, SwiGLU, the
-// resident weight loader, the KV cache, and end-to-end forward passes.
+// covering RMSNorm (root-mean-square layer normalization), RoPE (rotary
+// position embedding), matmul variants, attention, SwiGLU (Swish-Gated
+// Linear Unit) FFN (feed-forward network), resident weights, the KV
+// cache, and end-to-end forward passes.
 // Phases 0-5 roughly mirror the assignment milestones and optional
 // caching/batching checks.
 //
@@ -1743,7 +1745,7 @@ static int run_forward_pass(const float *h_embeddings, int seq_len,
                            d * sizeof(float), cudaMemcpyHostToDevice));
     gpu_rmsnorm(d_X, d_gamma, d_Xnorm, seq_len, d, RMS_NORM_EPSILON);
 
-    // Extract last row -> logits via shared lm_head helper
+    // Extract last row -> logits via the lm_head helper.
     std::vector<float> h_Xfinal(total);
     CUDA_CHECK(cudaMemcpy(h_Xfinal.data(), d_Xnorm, bytes_X,
                            cudaMemcpyDeviceToHost));
@@ -2305,7 +2307,7 @@ using TestFunc = std::function<int()>;
 // assignment milestones:
 //   Phase 0: matmul/loader smoke and parity (foundation laid in M1)
 //   Phase 1: RMSNorm + Q/K/V projections (M2)
-//   Phase 2: RoPE, GQA mapping, causal mask, softmax, attention (M3)
+//   Phase 2: RoPE, GQA (Grouped Query Attention), causal mask, softmax (M3)
 //   Phase 3: residual add, SwiGLU, full decoder block (M3)
 //   Phase 4: end-to-end forward pass for a known-good prompt (M3)
 //   Phase 5: final norm, untied lm_head, layer streaming, KV cache,

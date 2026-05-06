@@ -7,10 +7,10 @@ The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMS
 ## Notes for graders
 
 - **Required path uses FP32** (M1 grading tests via `bin/tests` 1..7, single-token inference). All 7 M1 tests pass on L4 (sm_89).
-- **Bonus path uses BF16** for resident weights (TODO #1, +5% credit) so all ~14.5 GB of Llama 3 8B can stay on L4's 24 GB VRAM. FP32 residency would need 32 GB. Per the discussion-board policy on BF16, please apply the relaxed-epsilon allowance to any internal M2-3 tests whose tolerances were written for FP32 reference values.
+- **Multi-token path uses BF16** for resident weights so all ~14.5 GB of Llama 3 8B can stay on L4's 24 GB VRAM. FP32 residency would need 32 GB. Per the discussion-board policy on BF16, please apply the relaxed-epsilon allowance to any internal M2-3 tests whose tolerances were written for FP32 reference values.
 - **Conclusive end-to-end test (`docs/assignment/llm_part2.md` §3.1 Step 6)**: `./bin/llm --max-tokens 8 "What is the capital of California?"` produces `"The capital of California is Sacramento."` (token-by-token argmax decode + EOT). Verified on L4 in this branch.
 - **Live demo:** `./scripts/demo-start.sh` brings up the L4, SSHes in, and drops into an interactive REPL (`./bin/llm --interactive`). Resident BF16 weights load once (~3 min); each subsequent prompt answers in ~3s. After the demo, `./scripts/demo-stop.sh` stops the VM.
-- **Bonus credit attempted**: TODO #1 (KV cache + resident weights, 5%) and TODO #2 (B>1 batching, 5%). Both ship with internal parity tests; see `tests/test_m2m3.cpp` (`batched_b2_distinct_parity`, etc.).
+- **Extensions shipped**: KV cache + resident weights, and B>1 batched generation. Both ship with internal parity tests; see `tests/test_m2m3.cpp` (`batched_b2_distinct_parity`, etc.).
 
 ## Quick start
 
@@ -53,7 +53,7 @@ The default lane is intentionally quick; the full lane is a final gate.
 ```bash
 ./tools/test_l4.sh          # quick lane: M1 + fast M2-3
 ./tools/test_l4.sh --unit   # M1 only
-./tools/test_l4.sh --perf   # TODO #1 KV-cache performance/audit
+./tools/test_l4.sh --perf   # KV-cache performance/audit
 ./tools/test_l4.sh --full   # final full regression gate
 ```
 
