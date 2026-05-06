@@ -19,9 +19,10 @@
 // 128000) token. The M1 grading example in llm_part1 §3.1.1 shows
 // "Hello world" -> [128000, 9906, 1917] WITH BOS — our TestAPI wrapper
 // (tests/test_api.cpp) prepends bos_id() so the grader sees the
-// expected leading 128000. The chat-template wrapper in inference.cu
-// also injects BOS itself. Keeping the bare encode() free of BOS lets
-// callers compose their own prefix.
+// expected leading 128000. The chat-template wrapper
+// (apply_chat_template in src/inference_chat.cu) also injects BOS
+// itself. Keeping the bare encode() free of BOS lets callers compose
+// their own prefix.
 vector<int> BPETokenizer::encode(const string &text) const {
     return encode_impl(text, true);
 }

@@ -61,8 +61,8 @@ KVCache::~KVCache() { free_all(); }
 
 // Bump the logical token count after `n` rows of K/V have been
 // written into the cache. The buffers themselves are written by the
-// K/V projection matmuls in inference.cu (they target k_at()/v_at()
-// directly); this function is bookkeeping only.
+// K/V projection matmuls in forward_step (src/inference_layer.cu),
+// which target k_at()/v_at() directly; this function is bookkeeping only.
 void KVCache::advance(int n) {
     if (n <= 0) return;
     if (len_ + n > max_len_) {

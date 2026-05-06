@@ -67,7 +67,7 @@ float *ModelWeights::get_embeddings(const std::vector<int> &token_ids) {
 //
 // Note: this function supports unequal-length batches at the embedding
 // layer, but the rest of the inference path currently requires equal
-// lengths (validate_equal_lengths in inference.cu enforces that).
+// lengths (validate_equal_lengths in inference_loop.cu enforces that).
 float *ModelWeights::get_embeddings_batched(
     const std::vector<std::vector<int>> &batched_ids,
     std::vector<int> &out_lens, int &out_smax) {
