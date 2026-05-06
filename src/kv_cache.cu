@@ -4,7 +4,7 @@
 // Holds one [batch, max_len, kv_dim] device buffer per layer for K and
 // for V. During prefill, K/V projection matmuls write rows
 // [len_before .. len_before+q_seq) into each layer's buffers; during
-// decode (q_seq=1) we append a single row per step. Attention then
+// decode (q_seq=1) one new row is appended per step. Attention then
 // reads the full [0, kv_seq) prefix of K and V without recomputing
 // the prompt tokens on every decode step.
 //
@@ -33,8 +33,8 @@ void cuda_check(cudaError_t err, const char *expr, const char *file, int line) {
 #define CUDA_CHECK(expr) cuda_check((expr), #expr, __FILE__, __LINE__)
 
 // Allocate device-side K and V buffers for every layer. Each is sized
-// for the full [batch, max_seq_len, kv_dim] capacity up front so we
-// never have to reallocate (or copy) mid-generation. With this
+// for the full [batch, max_seq_len, kv_dim] capacity up front so the
+// buffers never need to reallocate (or copy) mid-generation. With this
 // project's S_MAX=1024 and batch=1, this is 256 MiB total.
 KVCache::KVCache(int max_seq_len, int batch)
     : max_len_(max_seq_len), batch_(batch), len_(0) {

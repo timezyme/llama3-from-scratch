@@ -124,9 +124,9 @@ __global__ void scale_kernel(float *__restrict__ data, int count,
 // Why -1e6 instead of literal -inf: this is the conventional choice in
 // Llama-family reference implementations. exp(-1e6) underflows to
 // exactly 0.0 in FP32 (well below FLT_MIN ~ 1.18e-38), so the masked
-// positions still vanish from the softmax output — but by staying in
-// finite arithmetic we avoid any compiler fast-math edge cases that
-// can mis-handle inf operands.
+// positions still vanish from the softmax output — and finite
+// arithmetic dodges any compiler fast-math edge cases that mis-handle
+// inf operands.
 __global__ void causal_mask_kernel(float *__restrict__ S, int s) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= s * s) return;

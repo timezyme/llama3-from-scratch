@@ -69,8 +69,8 @@ void alloc_rope_tables(float **d_cos_out, float **d_sin_out) {
 
 // Pre-load all 32 layers' BF16 weights into VRAM if a resident-weights
 // holder was provided. This is paid once per process; later forward
-// steps reuse the resident copy. Telemetry prints VRAM use so we can
-// compare resident weights with the KV cache.
+// steps reuse the resident copy. Telemetry prints VRAM use so resident
+// weights can be compared against the KV cache footprint.
 void load_resident_layers(DeviceModelWeights *resident_weights) {
     if (resident_weights == nullptr) {
         return;

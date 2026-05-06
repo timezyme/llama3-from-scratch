@@ -17,7 +17,7 @@
 //
 // Note: encode() does NOT prepend the BOS (<|begin_of_text|>, ID
 // 128000) token. The M1 grading example in llm_part1 §3.1.1 shows
-// "Hello world" -> [128000, 9906, 1917] WITH BOS — our TestAPI wrapper
+// "Hello world" -> [128000, 9906, 1917] WITH BOS — the TestAPI wrapper
 // (tests/test_api.cpp) prepends bos_id() so the grader sees the
 // expected leading 128000. The chat-template wrapper
 // (apply_chat_template in src/inference_chat.cu) also injects BOS
@@ -36,7 +36,7 @@ vector<int> BPETokenizer::encode_no_merge(const string &text) const {
 // Decode token IDs back to text. Special tokens (BOS, EOS, headers,
 // etc.) are skipped because they are control markers — emitting their
 // "<|...|>" string forms back to the user would expose the chat
-// template to whoever called us.
+// template to the caller.
 string BPETokenizer::decode(const vector<int> &ids) const {
     string out;
     for (int id : ids) {
@@ -156,7 +156,7 @@ string BPETokenizer::b64decode(const string &s) {
     out.reserve(s.size() * 3 / 4);
 
     // Accumulate 6-bit chunks into bytes: shift in each char's value,
-    // emit a byte whenever we have 8+ bits buffered.
+    // emit a byte whenever 8+ bits are buffered.
     int val = 0, valb = -8;
     for (unsigned char c : s) {
         if (std::isspace(c))

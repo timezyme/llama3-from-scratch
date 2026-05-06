@@ -43,8 +43,8 @@ struct TensorHeader {
 };
 
 // Detect host byte order. Dump files are always little-endian (every
-// platform we run on is LE), but we still detect it explicitly so that
-// big-endian hosts get a clear error rather than wrong numbers.
+// supported platform is LE), but the check stays explicit so big-endian
+// hosts get a clear error rather than wrong numbers.
 bool is_little_endian_host() {
     uint16_t x = 1;
     return *reinterpret_cast<uint8_t *>(&x) == 1;
@@ -65,8 +65,8 @@ uint32_t bytes_per_element(uint32_t dtype_code) {
 
 // Read a little-endian uint32 from a byte pointer. memcpy is the
 // alias-safe equivalent of *(const uint32_t*)p (which is UB on
-// platforms where p is not 4-byte aligned). On big-endian hosts we
-// reassemble bytes manually so dump files load correctly anyway.
+// platforms where p is not 4-byte aligned). On big-endian hosts the
+// bytes are reassembled manually so dump files load correctly anyway.
 uint32_t read_u32_le(const uint8_t *p) {
     if (is_little_endian_host()) {
         uint32_t v = 0;
@@ -279,7 +279,7 @@ size_t LlamaDumpLoader::vocab_size(const std::string &dump_path,
         throw runtime_error("embedding_dim must be > 0");
     }
 
-    // Return cached value if we already loaded this file.
+    // Return the cached value if this file has already been loaded.
     if (embeddings_source_file_ == dump_path &&
         embeddings_dim_ == embedding_dim && !embeddings_blob_.empty()) {
         return embeddings_vocab_size_;

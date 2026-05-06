@@ -16,8 +16,8 @@
 // Why it's fast: each weight byte is loaded from slow HBM (high-bandwidth
 // memory) once and reused many times from fast on-chip shared memory.
 // Without this trick, every thread would re-read the same row of A from
-// HBM thousands of times — we'd be memory-bandwidth-bound, not compute-
-// bound, and the kernel would run an order of magnitude slower.
+// HBM thousands of times, leaving the kernel memory-bandwidth-bound
+// instead of compute-bound and an order of magnitude slower.
 //
 // Read the file top-to-bottom — the layout matches execution flow:
 //   Section 1: Tile-size constants (BM, BN, BK, TM, TN) — the design choices
@@ -37,7 +37,7 @@
 // choices and are explained inline at their first use below.
 //
 // Tensor cores are NOT used: that would require WMMA or mma.sync intrinsics
-// and stricter tile shapes than the ones we picked.
+// and stricter tile shapes than the ones chosen here.
 //
 // Glossary (used throughout the comments below):
 //   HBM  — GPU global DRAM. Big (24 GB on L4), slow (~300 ns).
@@ -157,7 +157,7 @@ __device__ __forceinline__ void load_bf16_quad(float *dst,
 __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
                               int K, int N) {
     // ---- PHASE A: shared-memory buffers + register accumulator ----------
-    // Two buffers per matrix so we can ping-pong (double-buffering). The
+    // Two buffers per matrix to enable ping-pong (double-buffering). The
     // leading [2] is the buffer index. The trailing +1 is column padding
     // to dodge bank conflicts: shared memory has 32 banks, so without the
     // +1 every thread reading the same logical column would hit one bank
@@ -237,10 +237,10 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     //       registers and run a TM x TN outer product, accumulating into
     //       acc[][]. This is where the FLOPs actually happen.
     //   (3) Barrier, then swap. Threads must finish reading `cur` before
-    //       any future iteration overwrites it. After the swap, what we
+    //       any future iteration overwrites it. After the swap, the tile
     //       just loaded into `nxt` becomes the next iteration's `cur`.
 
-    int cur = 0; // index of the buffer we'll compute on this iteration
+    int cur = 0; // buffer index this iteration will compute on
     for (int tile = 0; tile < num_tiles; ++tile) {
         int nxt = 1 - cur; // the OTHER buffer — that's where the prefetch goes
 
@@ -318,7 +318,7 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
 
         // ---- (3) Barrier and swap buffers ---------------------------------
         __syncthreads(); // every thread must finish reading `cur` before reuse
-        cur = nxt;       // what we just prefetched is the next iteration's input
+        cur = nxt;       // the freshly prefetched tile is the next iteration's input
     }
 
     // ---- PHASE D: write each thread's 64 accumulators back to C ---------
@@ -601,9 +601,9 @@ void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
 //
 // Same kernel as Section 5, but the caller has already put its tensors in
 // VRAM (Q, K, V, X, layer norms, etc. all live on the GPU during the
-// forward pass). So we skip the H2D and D2H copies — those would be wasted
-// PCIe (Peripheral Component Interconnect Express) traffic. Just launch
-// the kernel and return. Caller owns the d_* buffers.
+// forward pass). The H2D and D2H copies are skipped — they would be
+// wasted PCIe (Peripheral Component Interconnect Express) traffic.
+// Just launch the kernel and return. Caller owns the d_* buffers.
 //
 // This is the entry point used by every projection inside the forward pass
 // when running with FP32 weights.

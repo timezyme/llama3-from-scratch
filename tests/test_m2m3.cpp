@@ -1,11 +1,11 @@
 // Internal test harness for Milestones 2-3.
 //
 // This file is NOT the M1 grading harness (that lives in tests/test.cpp
-// and is read-only). It is our own per-operator/integration test suite
-// covering RMSNorm (root-mean-square layer normalization), RoPE (rotary
-// position embedding), matmul variants, attention, SwiGLU (Swish-Gated
-// Linear Unit) FFN (feed-forward network), resident weights, the KV
-// cache, and end-to-end forward passes.
+// and is read-only). It is the project's own per-operator/integration
+// test suite covering RMSNorm (root-mean-square layer normalization),
+// RoPE (rotary position embedding), matmul variants, attention, SwiGLU
+// (Swish-Gated Linear Unit) FFN (feed-forward network), resident
+// weights, the KV cache, and end-to-end forward passes.
 // Phases 0-5 roughly mirror the assignment milestones and optional
 // caching/batching checks.
 //
@@ -572,8 +572,8 @@ static int test_weight_shape_qkv() {
 }
 
 // Verifies Q projection against golden output.
-// Q = RMSNorm(X) @ W_q^T. Weight was transposed at load time,
-// so we compute: Q = X_norm @ q_proj_transposed.
+// Q = RMSNorm(X) @ W_q^T. Weight was transposed at load time, so
+// the actual call is: Q = X_norm @ q_proj_transposed.
 static int test_q_projection_fixture() {
     const int s = 3, d = EMBEDDING_DIM;
     const int q_out = EMBEDDING_DIM; // NUM_HEADS * HEAD_DIM = 4096
@@ -2171,7 +2171,7 @@ static int test_full_forward_kv_cache_one_token_parity() {
 }
 
 // Proves: the resident BF16 layer path preserves the first-token result from
-// the existing streaming path before we use it as the CLI default.
+// the existing streaming path before promoting it to the CLI default.
 static int test_full_forward_resident_one_token_parity() {
     const std::string prompt = "The capital of France is";
 

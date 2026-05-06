@@ -53,10 +53,9 @@ struct AttentionScratch {
 
 // Run GQA (Grouped Query Attention) for one batch slot, all 32 heads.
 //
-// This implements the "loop over all h=32 query heads in your C++
-// controller, launching CUDA kernels for each head's score
-// computation, mask application, softmax, and weighted sum" approach
-// suggested in llm_part2 §3.2.
+// Implements the per-head loop sketched in llm_part2 §3.2: iterate over
+// all h=32 query heads and, for each one, launch CUDA kernels for the
+// score matrix, mask, softmax, and weighted sum.
 //
 // Shapes (per batch slot):
 //   d_Q_b:    [q_seq, NUM_HEADS * HEAD_DIM]      = [q_seq, 32 * 128]
@@ -78,13 +77,13 @@ struct AttentionScratch {
 // tradeoff is extra HBM (high-bandwidth memory) traffic instead of a
 // separate strided-input matmul.
 //
-// Causal-mask gating: we skip the mask whenever q_seq == 1 (decode
+// Causal-mask gating: the mask is skipped whenever q_seq == 1 (decode
 // step) because the single new query attends to every cached position
 // up to and including itself, none of which is "in the future".
 // During prefill (q_seq == kv_seq > 1) the mask is required so each
-// position only attends to itself and earlier tokens. We also skip
-// when q_seq == 1 == kv_seq (the very first prefill of a 1-token prompt
-// — there is nothing to mask).
+// position only attends to itself and earlier tokens. The mask is also
+// skipped when q_seq == 1 == kv_seq (the very first prefill of a
+// 1-token prompt — nothing to mask).
 void run_attention_heads(const float *d_Q_b, const float *d_K_b,
                          const float *d_V_b, float *d_attn_b,
                          const AttentionScratch &scratch, int q_seq,
@@ -100,8 +99,8 @@ void run_attention_heads(const float *d_Q_b, const float *d_K_b,
         int kvg = hi / heads_per_group;
 
         // Pull per-head slices straight out of device memory. The K
-        // gather also transposes (gives us K_g^T) so the next matmul is
-        // a straight row-major GEMM.
+        // gather also transposes (producing K_g^T) so the next matmul
+        // is a straight row-major GEMM.
         gpu_gather_head(d_Q_b, scratch.d_Qi, q_seq, HEAD_DIM, q_stride,
                         hi * HEAD_DIM);
         gpu_gather_head_transpose(d_K_b, scratch.d_KgT, kv_seq, HEAD_DIM,
@@ -165,9 +164,9 @@ std::vector<float> compute_lm_head_logits(const float *lm_head,
 //   weights    streaming-from-disk model weights (used when resident is null).
 //   cache      device-side per-layer K/V tensors. cache.len() is the number
 //              of tokens already cached; advances by q_seq at the end.
-//   d_cos_full,d_sin_full  full S_MAX-sized RoPE tables on the device. We
-//              advance into them by `len_before * (h_d/2)` so this step
-//              sees positions [len_before, len_before+q_seq).
+//   d_cos_full,d_sin_full  full S_MAX-sized RoPE tables on the device.
+//              The kernel advances into them by `len_before * (h_d/2)`
+//              so this step sees positions [len_before, len_before+q_seq).
 //   resident_weights  if non-null, bypass the H2D upload and use BF16
 //              tensors that already live in VRAM (video RAM).
 //   batch      number of independent prompts processed in lockstep.
@@ -208,7 +207,7 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
     // and reused across all 32 decoder blocks. The weight pointers
     // (d_w*) are only allocated on the streaming-from-disk path; on the
     // resident path the layer's BF16 tensors already live in VRAM and
-    // we just take pointers into them.
+    // pointers into them are used directly.
     float *d_X = nullptr, *d_Xnorm = nullptr;
     float *d_Q = nullptr;
     float *d_gamma = nullptr;
@@ -318,9 +317,9 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             // Q is computed for the whole batch at once (rows = batch*q_seq)
             // because every row independently produces an output Q row.
             // K and V instead must be written into per-batch cache slices
-            // at [b, len_before:len_before+q_seq, :], so we issue one
-            // matmul per batch slot. This batched v1 layout is less efficient
-            // than a strided 3D matmul.
+            // at [b, len_before:len_before+q_seq, :], so the loop issues
+            // one matmul per batch slot. This batched v1 layout is less
+            // efficient than a strided 3D matmul.
             if (resident_lw != nullptr) {
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->q_proj,
                                               d_Q, rows, d, d);
@@ -349,11 +348,10 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             }
             // RoPE rotates Q and the new K rows in place. V is NOT
             // rotated (RoPE encodes the query/key dot-product geometry,
-            // not the attended values). We must apply RoPE only to the
-            // newly written K rows — older cached K already had RoPE
-            // applied in earlier steps. K rotation runs per batch slot
-            // because each slot's new K rows live in a different cache
-            // region.
+            // not the attended values). RoPE applies only to the newly
+            // written K rows — older cached K already had RoPE applied
+            // in earlier steps. K rotation runs per batch slot because
+            // each slot's new K rows live in a different cache region.
             gpu_rope(d_Q, d_cos_step, d_sin_step, rows, NUM_HEADS, HEAD_DIM,
                      q_seq);
             for (int b = 0; b < batch; ++b) {
@@ -364,10 +362,11 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
         }
 
         // ===== Attention heads: scaled dot-product per head, GQA-grouped =====
-        // Q lives in d_Q; the K/V buffers come from the KV cache so we
-        // see the full prefix [0, kv_seq) without recomputing it.
-        // Everything stays on the GPU — the gather/scatter kernels slice
-        // per-head views without crossing PCIe.
+        // Q lives in d_Q; the K/V buffers come from the KV cache, so
+        // the full prefix [0, kv_seq) is visible to attention without
+        // recomputing it. Everything stays on the GPU — the
+        // gather/scatter kernels slice per-head views without crossing
+        // PCIe.
         {
             Stopwatch sw("layer.attn_heads");
             for (int b = 0; b < batch; ++b) {
@@ -443,8 +442,8 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
                            d * sizeof(float), cudaMemcpyHostToDevice));
     gpu_rmsnorm(d_X, d_gamma, d_Xnorm, rows, d, RMS_NORM_EPSILON);
 
-    // Greedy decoding only needs logits for the LAST row, so we copy
-    // just that row back to host. Projecting the entire [s, d] matrix
+    // Greedy decoding only needs logits for the LAST row, so only that
+    // row is copied back to host. Projecting the entire [s, d] matrix
     // through lm_head ([V=128256, d]) would be wasteful and risks VRAM
     // pressure for long sequences. (Pitfall: llm_part2 §4.)
     std::vector<float> last_hidden(static_cast<size_t>(batch) * d);

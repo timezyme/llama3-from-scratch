@@ -2,9 +2,8 @@
 //
 // Pulled into the global namespace deliberately to keep call sites
 // terse (e.g. `vector<int>` instead of `std::vector<int>` everywhere
-// in tokenizer.h, loader.h, etc.). This is acceptable for an
-// application-only project — for a public library we'd keep names
-// fully qualified.
+// in tokenizer.h, loader.h, etc.). Acceptable for an application-only
+// project — a public library would keep names fully qualified.
 
 #pragma once
 

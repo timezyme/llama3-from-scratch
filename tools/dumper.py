@@ -177,7 +177,7 @@ def dump_all_tensors(model_dir: Path, out_dir: Path, target_dtype: torch.dtype) 
     """
     weight_map = load_weight_map(model_dir)
 
-    # Group tensors by shard so we only open each shard file once.
+    # Group tensors by shard so each shard file is opened only once.
     shard_to_tensors: Dict[str, List[str]] = {}
     for tensor_name, shard_name in weight_map.items():
         shard_to_tensors.setdefault(shard_name, []).append(tensor_name)

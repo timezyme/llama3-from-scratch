@@ -1,8 +1,8 @@
 // Implementations of the four TestAPI methods the M1 grading harness
 // (tests/test.cpp) calls into. The header (tests/test_api.h) is marked
 // "DO NOT MODIFY" — it is supplied by the course staff and replaced at
-// grading time. This file is our adapter from those signatures into
-// our project's loader/tokenizer/matmul code.
+// grading time. This file is the adapter from those signatures into
+// the project's loader/tokenizer/matmul code.
 //
 // Both shared helpers below construct a single static instance per
 // process so repeated TestAPI calls don't re-parse the tokenizer or
@@ -17,7 +17,7 @@
 
 namespace {
 // Process-wide tokenizer instance. The vocab parse (~128k entries) is
-// non-trivial so we cache it across calls.
+// non-trivial, so the instance is cached across calls.
 BPETokenizer &shared_tokenizer() {
     static BPETokenizer tok(TOKENIZER_PATH);
     return tok;

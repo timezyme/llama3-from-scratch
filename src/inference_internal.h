@@ -21,8 +21,8 @@ class DeviceModelWeights;
 class KVCache;
 
 // Sequence-length cap for the KV cache and RoPE table. The assignment
-// (llm_part1 §3.1.1) bounds the prompt at 1000 tokens; we round up to
-// 1024 for headroom plus generated tokens.
+// (llm_part1 §3.1.1) bounds the prompt at 1000 tokens; this rounds up
+// to 1024 for headroom plus generated tokens.
 inline constexpr int S_MAX = 1024;
 
 // <|eot_id|>: end-of-turn sentinel emitted by the Llama 3 Instruct

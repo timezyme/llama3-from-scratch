@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Creates a custom GCP Machine Image from your fully-provisioned VM.
-# Run this once after you've successfully run provision_l4.sh and
-# verified everything is working.
+# Creates a custom GCP Machine Image from a fully-provisioned VM.
+# Intended to be run once after a successful provision_l4.sh run, with
+# the VM verified working.
 
 set -euo pipefail
 

@@ -1,8 +1,9 @@
 // Per-layer host-side weight management for Llama 3 8B.
-// Checkpoint projection weights are [out_features, in_features], so we
-// transpose once at load time to [in, out]. That makes runtime matmul
-// calls match llm_part2 §4's X * W^T math without an extra kernel.
-// Layers load/unload individually for the streaming inference path.
+// Checkpoint projection weights are [out_features, in_features], and a
+// one-shot transpose at load time stores them as [in, out]. That makes
+// runtime matmul calls match llm_part2 §4's X * W^T math without an
+// extra kernel. Layers load/unload individually for the streaming
+// inference path.
 
 #include "model_weights.h"
 
@@ -34,9 +35,9 @@ ModelWeights::~ModelWeights() {
 // Llama 3 8B Instruct sets `tie_word_embeddings = false` in its
 // config.json, so lm_head is a separate 128256x4096 tensor (not the
 // embedding table). The Part 2 assignment text says "shared with the
-// embedding table"; that is true for vanilla Llama 3 but NOT for the
-// instruct variant we use, which is why we always load lm_head as its
-// own tensor here.
+// embedding table"; that holds for vanilla Llama 3 but NOT for the
+// instruct variant in this project, which is why lm_head is always
+// loaded as its own tensor here.
 void ModelWeights::load_global() {
     // Cache the raw embedding payload; rows are decoded on demand.
     if (!loader_.load_embeddings(dump_dir_ + "/embeddings.bin", EMBEDDING_DIM)) {
@@ -226,7 +227,7 @@ std::string ModelWeights::layer_path(int layer_idx,
 // Transpose a row-major [rows, cols] FP32 matrix into a new
 // [cols, rows] buffer. Heap-allocated; caller owns the result.
 // Used at load time to flip every projection weight from the
-// HuggingFace [out, in] layout to the [in, out] layout our matmul
+// HuggingFace [out, in] layout to the [in, out] layout the matmul
 // path consumes.
 float *ModelWeights::transpose(const float *src, size_t rows, size_t cols) {
     float *dst = new float[rows * cols];

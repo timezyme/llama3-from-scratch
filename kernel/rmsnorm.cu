@@ -32,13 +32,13 @@
 //     Processors (PMPP), Chapter 9.
 //
 // Common pitfalls (silent correctness bugs to watch for):
-//   - Epsilon goes INSIDE the sqrt: sqrt(mean(x^2) + eps). If you write
-//     sqrt(mean(x^2)) + eps instead, a row of all zeros divides by ~eps
-//     and the activation explodes.
+//   - Epsilon goes INSIDE the sqrt: sqrt(mean(x^2) + eps). The variant
+//     sqrt(mean(x^2)) + eps fails on all-zero rows, dividing by ~eps and
+//     blowing the activation up.
 //   - The gamma multiply must NOT be skipped. Each call site has its own
 //     learned gamma; Llama 3 has 2 vectors per decoder layer (pre-attn,
-//     pre-FFN) plus 1 final-norm gamma — easy to miss-wire if you treat
-//     them as one.
+//     pre-FFN) plus 1 final-norm gamma — easy to miss-wire if all three
+//     are treated as one.
 //
 // Glossary:
 //   epsilon — small constant (1e-5 in this project) for numerical safety.
@@ -131,9 +131,10 @@ __global__ void rmsnorm_kernel(const float *__restrict__ input,
     // Epsilon is inside the sqrt so a row with sum_sq = 0 still produces
     // a finite (small) divisor instead of dividing by zero. Every thread
     // computes this scalar independently — sdata[0], cols, and epsilon
-    // are already visible to all threads after the reduction barrier, so
-    // we skip the dedicated "one-thread-broadcasts" pattern. Equivalent
-    // result, simpler code, one extra div+sqrt per thread (negligible).
+    // are already visible to all threads after the reduction barrier,
+    // so the dedicated "one-thread-broadcasts" pattern is skipped.
+    // Equivalent result, simpler code, one extra div+sqrt per thread
+    // (negligible).
     float rms = sqrtf(sdata[0] / static_cast<float>(cols) + epsilon);
 
     // ---- PASS 2: scale and write back ----------------------------------

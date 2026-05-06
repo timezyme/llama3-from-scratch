@@ -2,11 +2,11 @@
 """Verify reference.py matches gen_m2m3_fixtures.py numerically.
 
 Runs the same forward pass using:
-  1. reference.py (PyTorch)            - what TAs use to grade
-  2. gen_m2m3_fixtures.py logic (NumPy) - what our CUDA kernels match
+  1. reference.py (PyTorch)             - the grading reference
+  2. gen_m2m3_fixtures.py logic (NumPy) - the project's CUDA-matched path
 
 Compares per-operator outputs (RMSNorm, QKV, RoPE, attention, FFN,
-final hidden, logits, argmax). If they agree within tolerance, our
+final hidden, logits, argmax). If they agree within tolerance, the
 CUDA kernels transitively match the grading reference.
 
 Usage:
@@ -34,7 +34,7 @@ PROMPTS = {
     "medium": [128000, 791, 6864, 315, 9822, 374],    # <BOS> The capital of France is
 }
 
-# Known-good next tokens produced by our NumPy reference (matches CUDA output).
+# Known-good next tokens produced by the NumPy reference (matches CUDA output).
 EXPECTED_NEXT_TOKEN = {
     "hello":  0,
     "medium": 12366,
