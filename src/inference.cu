@@ -71,10 +71,9 @@ constexpr int ASSISTANT_TOKEN = 78191;  // BPE token for "assistant"
 //
 // Note: llm_part1 §3.1.1 says "You are not required to insert special
 // tokens in this milestone; special-token handling will be specified
-// later." We add the chat template here because we run the
-// instruction-tuned variant (Llama-3-8B-Instruct) end-to-end —
-// without these wrapper tokens the model produces noticeably worse
-// completions, even though M1 grading does not require them.
+// later." We add the chat template here because the end-to-end path
+// runs the instruction-tuned variant, whose prompts are expected to
+// follow this wrapper. M1 grading still uses bare tokenization.
 std::vector<int> apply_chat_template(const BPETokenizer &tok,
                                      const std::string &prompt) {
     auto encoded = tok.encode(prompt);

@@ -1874,7 +1874,7 @@ static int test_lm_head_last_token_only() {
     const int s = 3;
     const int d = EMBEDDING_DIM;
 
-    // Load real embedding table via ModelWeights
+    // Load global weights via ModelWeights.
     ModelWeights weights(DUMP_DIR);
     weights.load_global();
 
@@ -1939,7 +1939,7 @@ static int test_weight_sharing_check() {
     // Compute full logits via the lm_head helper.
     auto logits = compute_lm_head_logits(weights.global().lm_head, h_x.data());
 
-    // Verify by manually computing dot products against lm_head rows for sampled IDs
+    // Verify by manually computing dot products against sampled lm_head rows.
     std::vector<int> sample_ids = {42, 1337, 2048};
     const float *lm_head = weights.global().lm_head;
 

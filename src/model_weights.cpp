@@ -103,9 +103,9 @@ float *ModelWeights::get_embeddings_batched(
     return stacked.release();
 }
 
-// Load all 9 tensors for a single decoder layer (2 RMSNorm gammas, 4
-// attention projections, 3 FFN/feed-forward projections). Idempotent: if the layer
-// was already loaded, returns the cached struct. Each 2D weight is
+// Load all 9 tensors for a decoder layer: 2 RMSNorm gammas, 4 attention
+// projections, and 3 FFN/feed-forward projections. Idempotent: if the
+// layer was already loaded, returns the cached struct. Each 2D weight is
 // transposed in CPU memory so the caller's matmul never has to.
 const LayerWeights &ModelWeights::load_layer(int layer_idx) {
     if (layer_idx < 0 || layer_idx >= NUM_LAYERS) {

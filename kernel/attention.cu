@@ -11,9 +11,8 @@
 //   - SCALE by 1/sqrt(h_d) before softmax. Without scaling, dot products
 //     grow as O(sqrt(h_d)) and push softmax into the saturated regime.
 //   - CAUSAL MASK on every (p,q) with q>p across the full s*s score
-//     matrix, not just the diagonal or last row. We add -1e6 (a large
-//     negative finite value) instead of -inf so a downstream NaN from
-//     0*inf can't sneak in if a row is entirely masked.
+//     matrix, not just the diagonal or last row. We use -1e6, the finite
+//     sentinel suggested in llm_part2 §3.2, instead of literal -inf.
 //   - NUMERICALLY STABLE SOFTMAX: subtract the per-row max before
 //     exp(). Skipping this step makes exp() overflow on even modestly
 //     large scores; the assignment marks this as non-optional.
@@ -63,8 +62,7 @@ __global__ void scale_kernel(float *__restrict__ data, int count,
 // Why -1e6 instead of -inf: llm_part2 §3.2 explicitly suggests "add a
 // large negative value such as -10^6 (acting as -inf) to all positions
 // where q>p, then proceed with softmax normally." A finite sentinel
-// also keeps downstream ops safe — if a row were ever fully masked,
-// exp(-inf)=0 and 0/0 inside softmax would produce NaN.
+// also avoids literal infinities in the score matrix before softmax.
 __global__ void causal_mask_kernel(float *__restrict__ S, int s) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= s * s) return;
@@ -166,9 +164,8 @@ __global__ void gather_head_kernel(const float *__restrict__ src,
 //
 // Tiled with shared memory: both the source loads (consecutive `c`) and
 // the destination stores (consecutive `r` on the transposed side) are
-// coalesced. The +1 column padding on the shared tile staggers the
-// store addresses so threads in a warp hit different banks (bank
-// conflicts during transpose are otherwise the bottleneck).
+// coalesced. The +1 column padding staggers shared-memory addresses so
+// the transpose store pattern avoids same-bank columns.
 constexpr int GATHER_T_TILE = 32;
 __global__ void gather_head_transpose_kernel(const float *__restrict__ src,
                                              float *__restrict__ dst, int rows,

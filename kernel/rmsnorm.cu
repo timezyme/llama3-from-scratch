@@ -86,10 +86,8 @@ void gpu_rmsnorm(const float *d_input, const float *d_gamma,
                  float *d_output, int rows, int cols, float epsilon) {
     if (rows <= 0 || cols <= 0) return;
 
-    // 256 threads per block: power-of-2 (clean tree reduction) and a
-    // good occupancy point on Turing/Ada. cols=4096 means each thread
-    // handles 4096/256 = 16 elements per pass, plenty of work per
-    // thread to amortize the reduction overhead.
+    // 256 threads per block keeps the tree reduction power-of-two.
+    // For cols=4096, each thread handles 16 elements per pass.
     const int threads = 256;
     const int shared_bytes = threads * sizeof(float);
 

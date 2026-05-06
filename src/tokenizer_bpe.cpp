@@ -245,9 +245,8 @@ vector<int> BPETokenizer::encode_impl(const string &text,
 // to search over.
 //
 // Complexity is O(n^2) per chunk in the worst case (each merge scans
-// O(n) pairs and reduces length by 1), but Llama 3 chunks rarely
-// exceed a few dozen bytes between special tokens, so this is fine in
-// practice.
+// O(n) pairs and reduces length by 1). Tokenization is still small
+// relative to the 32-layer GPU forward pass in this project.
 vector<int> BPETokenizer::encode_chunk(const string &s,
                                        bool enable_merge) const {
     // Initialize: each byte becomes its own token.

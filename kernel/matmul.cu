@@ -23,8 +23,7 @@ namespace {
 // is reused by every output column in the block (BN = 128 reuses), and
 // each smB element is reused by every output row (BM = 128 reuses).
 // BK = 16 keeps two double-buffered shared tiles (smA + smB, including
-// the +1 padding) well under the per-block shared-memory budget on
-// Turing/Ada (~64 KiB default).
+// the +1 padding) within typical per-block shared-memory budgets.
 constexpr int BM = 128;   // rows of C per block
 constexpr int BN = 128;   // cols of C per block
 constexpr int BK = 16;    // K-depth of each loaded tile
@@ -67,9 +66,8 @@ __device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
 }
 
 // Load 4 BF16 values from src and widen each to FP32 in dst.
-// One uint2 (8 bytes) is loaded per call, so the compiler can issue an
-// LDG.E.64 — a single coalesced 64-bit transaction per thread — instead
-// of four separate 16-bit loads.
+// One uint2 (8 bytes) is loaded per call, so the compiler can use an
+// aligned 64-bit load instead of four separate 16-bit loads.
 __device__ __forceinline__ void load_bf16_quad(float *dst,
                                                const uint16_t *src) {
     uint2 packed = *reinterpret_cast<const uint2 *>(src);

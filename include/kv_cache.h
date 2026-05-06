@@ -14,7 +14,7 @@
 // pointers held by the kernels or force a large device-to-device
 // copy. The cost is bounded VRAM (video RAM): at S_MAX=1024,
 // 32 layers x 1024 rows x (NUM_KV_HEADS * HEAD_DIM = 1024) x 4 bytes
-// x 2 (K and V) = 256 MB at batch=1.
+// x 2 (K and V) = 256 MiB at batch=1.
 //
 // Lifetime: cudaMalloc on construction, cudaFree on destruction.
 // reset() rewinds the logical length without freeing memory so a REPL

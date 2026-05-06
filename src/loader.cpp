@@ -234,7 +234,7 @@ float_t *load_dense_tensor_checked(const string &dump_file, size_t dim0,
 }
 
 // Load a BF16-only tensor without widening to FP32. Used by the
-// resident-VRAM path so weights stay half precision in GPU memory.
+// resident-VRAM (video RAM) path so weights stay half precision in GPU memory.
 // This halves weight HBM (high-bandwidth memory) bytes during matmul.
 // Falls back to a clear error if the dump dtype is not BF16.
 std::vector<uint16_t> load_bf16_raw_tensor_checked(const string &dump_file,
@@ -271,9 +271,8 @@ LlamaDumpLoader::LlamaDumpLoader(DumpFloatType float_type)
 LlamaDumpLoader::~LlamaDumpLoader() = default;
 
 // Read just the embedding dump's vocab size (= shape[0]) by loading
-// and caching the file. Subsequent calls (and any later
-// get_embeddings) reuse the cached blob, so this is "free" after the
-// first hit.
+// and caching the file. Subsequent calls and later get_embeddings()
+// reuse the cached blob instead of re-reading the file.
 size_t LlamaDumpLoader::vocab_size(const std::string &dump_path,
                                    int embedding_dim) {
     if (embedding_dim <= 0) {
@@ -294,12 +293,10 @@ size_t LlamaDumpLoader::vocab_size(const std::string &dump_path,
 
 // Load the entire embedding dump into memory and cache the blob.
 //
-// We do not eagerly decode all 128256 rows to FP32 because most prompts
-// only touch a few dozen unique tokens. Instead the raw payload stays
-// in memory and get_embeddings() decodes only the rows the caller
-// asks for — this is the embedding-lookup pattern from llm_part1
-// §3.1.1 Step 4. Returns false on header/shape mismatch so callers can
-// surface a clean error.
+// We do not eagerly decode all 128256 rows to FP32. The raw payload stays
+// in memory and get_embeddings() decodes only requested token rows, which
+// matches the embedding-lookup pattern from llm_part1 §3.1.1 Step 4.
+// Returns false on header/shape mismatch so callers can surface a clean error.
 bool LlamaDumpLoader::load_embeddings(const std::string &dump_path,
                                       int embedding_dim) {
     if (embedding_dim <= 0) {
