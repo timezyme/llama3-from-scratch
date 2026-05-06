@@ -50,6 +50,9 @@ ifeq ($(CUDA_ENABLED),1)
   MAIN_CUDA_OBJECTS := $(BUILD_DIR)/model_weights.o \
                        $(BUILD_DIR)/device_weights.o \
                        $(BUILD_DIR)/inference.o \
+                       $(BUILD_DIR)/inference_chat.o \
+                       $(BUILD_DIR)/inference_layer.o \
+                       $(BUILD_DIR)/inference_loop.o \
                        $(BUILD_DIR)/kv_cache.o \
                        $(CUDA_KERNEL_OBJECTS)
   OBJECTS += $(MAIN_CUDA_OBJECTS)
@@ -86,6 +89,12 @@ $(BUILD_DIR)/model_weights.o: $(SRC_DIR)/model_weights.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/device_weights.o: $(SRC_DIR)/device_weights.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/inference.o: $(SRC_DIR)/inference.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/inference_chat.o: $(SRC_DIR)/inference_chat.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/inference_layer.o: $(SRC_DIR)/inference_layer.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
+$(BUILD_DIR)/inference_loop.o: $(SRC_DIR)/inference_loop.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/kv_cache.o: $(SRC_DIR)/kv_cache.cu | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
@@ -142,6 +151,9 @@ M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
                      $(BUILD_DIR)/model_weights.o \
                      $(BUILD_DIR)/device_weights.o \
                      $(BUILD_DIR)/inference.o \
+                     $(BUILD_DIR)/inference_chat.o \
+                     $(BUILD_DIR)/inference_layer.o \
+                     $(BUILD_DIR)/inference_loop.o \
                      $(BUILD_DIR)/kv_cache.o \
                      $(BUILD_DIR)/tokenizer_bpe.o \
                      $(BUILD_DIR)/loader.o \
