@@ -131,7 +131,7 @@ case '${LANE}' in
         BUILD_TARGETS='all tests'
         ;;
     perf)
-        BUILD_TARGETS='all'
+        BUILD_TARGETS='all tests_m2m3'
         ;;
     quick|full)
         BUILD_TARGETS='all tests tests_m2m3'
@@ -158,7 +158,7 @@ run_m2m3() {
     echo
     if [ \"\$mode\" = quick ]; then
         echo '=== M2-3 quick (skipping full_forward_* and layer_streaming_smoke) ==='
-        M2_TESTS=\$(./bin/tests_m2m3 --list | grep -Ev '^  (full_forward_|layer_streaming_smoke$)')
+        M2_TESTS=\$(./bin/tests_m2m3 --list | grep -Ev '^  (full_forward_|layer_streaming_smoke$|kv_cache_multi_step_parity$)')
     else
         echo '=== M2-3 full (all tests; final gate only) ==='
         M2_TESTS=\$(./bin/tests_m2m3 --list)
@@ -206,9 +206,28 @@ run_kv_perf() {
     echo 'PASS kv_cache_perf'
 }
 
+run_kv_parity() {
+    echo
+    echo '=== PERF: KV cache multi-step parity (T=4) ==='
+    set +e
+    OUT=\$(./bin/tests_m2m3 kv_cache_multi_step_parity 2>&1)
+    STATUS=\$?
+    set -e
+    printf '%s\n' \"\$OUT\"
+    if [ \$STATUS -ne 0 ] || ! printf '%s' \"\$OUT\" | grep -q '^PASS'; then
+        KV_PARITY_FAIL=1
+        KV_PARITY_STATUS=FAIL
+    else
+        KV_PARITY_FAIL=0
+        KV_PARITY_STATUS=PASS
+    fi
+}
+
 M1_FAIL=0
 M2_FAIL=0
 M2_COUNT=0
+KV_PARITY_FAIL=0
+KV_PARITY_STATUS=SKIP
 
 case '${LANE}' in
     unit)
@@ -226,6 +245,10 @@ case '${LANE}' in
         ;;
     perf)
         run_kv_perf
+        run_kv_parity
+        echo
+        echo \"=== SUMMARY: lane=perf  kv_perf=PASS  kv_parity=\$KV_PARITY_STATUS ===\"
+        [ \$KV_PARITY_FAIL -eq 0 ]
         ;;
     full)
         run_m1

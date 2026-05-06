@@ -147,7 +147,13 @@ ifeq ($(CUDA_ENABLED),1)
 
 M2M3_KERNEL_OBJECTS := $(CUDA_KERNEL_OBJECTS)
 
-M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3.o \
+M2M3_TEST_OBJECTS := $(BUILD_DIR)/test_m2m3_main.o \
+                     $(BUILD_DIR)/test_m2m3_helpers.o \
+                     $(BUILD_DIR)/test_m2m3_matmul.o \
+                     $(BUILD_DIR)/test_m2m3_rmsnorm_proj.o \
+                     $(BUILD_DIR)/test_m2m3_rope_attn.o \
+                     $(BUILD_DIR)/test_m2m3_decoder_full.o \
+                     $(BUILD_DIR)/test_m2m3_kv_batch.o \
                      $(BUILD_DIR)/model_weights.o \
                      $(BUILD_DIR)/device_weights.o \
                      $(BUILD_DIR)/inference.o \
@@ -164,7 +170,9 @@ tests_m2m3: $(BIN_DIR)/tests_m2m3
 $(BIN_DIR)/tests_m2m3: $(M2M3_TEST_OBJECTS) | $(BIN_DIR)
 	$(CXX) $(M2M3_TEST_OBJECTS) -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/test_m2m3.o: tests/test_m2m3.cpp | $(BUILD_DIR)
+# Pattern rule scoped by the `test_m2m3_` prefix so it does NOT match
+# tests/test.cpp or tests/test_api.cpp (M1 harness, compiled with g++).
+$(BUILD_DIR)/test_m2m3_%.o: tests/test_m2m3_%.cpp | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c $< -o $@
 
 $(BUILD_DIR)/rmsnorm.o: kernel/rmsnorm.cu | $(BUILD_DIR)
