@@ -1,7 +1,56 @@
-// Rotary Position Embedding (RoPE) for Llama 3 Q/K heads.
-// llm_part2 §4 has two required details: base is 500000, and pair i
-// rotates with i + h_d/2 rather than even/odd neighbors. Cos/sin are
-// precomputed as [seq_len, h_d/2] tables before the forward pass.
+// ============================================================================
+// rope.cu — Rotary Position Embedding (RoPE) for Llama 3 Q/K heads.
+// ============================================================================
+//
+// What it does: rotates each Q (or K) vector by an angle that depends on
+// the token's position in the sequence. Encodes "where in the prompt is
+// this token" directly into the activations, so attention sees position
+// naturally — no separate learned position embeddings required.
+//
+// Per-pair formula (i ranges over [0, h_d/2)):
+//   theta = 1 / base^(2i / h_d)
+//   angle = position * theta
+//   x_new[i]        =  x[i] * cos(angle) - x[i + h_d/2] * sin(angle)
+//   x_new[i+h_d/2]  =  x[i] * sin(angle) + x[i + h_d/2] * cos(angle)
+//
+// This is a 2x2 rotation [c -s; s c] applied to every (i, i + h_d/2) pair.
+//
+// Where this kernel runs in the forward pass:
+//   Twice per decoder block — once on Q, once on K — immediately after
+//   the per-head gather and before the score-matrix matmul Q * K^T.
+//   V is NOT rotated (positional information flows through Q and K only).
+//
+// Read the file top-to-bottom — the layout matches execution order:
+//   Section 1: Small helper (CUDA error wrap).
+//   Section 2: rope_kernel              — apply rotation in place on device.
+//   Section 3: gpu_rope                 — host entry for the device kernel.
+//   Section 4: precompute_rope_table    — build cos/sin tables on the host
+//                                         (called once per inference pass,
+//                                          uploaded to VRAM after).
+//
+// Credit:
+//   - Algorithm: Su, Lu, Pan, Murtadha, Wen, Liu, "RoFormer: Enhanced
+//     Transformer with Rotary Position Embedding" (arXiv:2104.09864, 2021).
+//   - Llama 3 specifics (base = 500000 instead of 10000; rotate-half
+//     pairing of (i, i + h_d/2) instead of (2i, 2i + 1)): Meta AI Llama 3
+//     release; HuggingFace transformers reference implementation in
+//     `modeling_llama.py`.
+//
+// Common pitfalls (failure modes the Credit-cited conventions prevent):
+//   - Wrong base (10000 from the paper instead of 500000): works fine on
+//     short prompts — the bug only surfaces on long-context eval.
+//   - Wrong pairing (interleaved (2i, 2i+1) instead of rotate-half):
+//     outputs look plausible but token logits are subtly wrong.
+//   Both bugs are silent at first glance, which is why this kernel ships
+//   them as project-wide constants instead of leaving them at call sites.
+//
+// Glossary:
+//   h_d      — head dimension (128 for Llama 3 8B).
+//   half_hd  — h_d / 2 = number of rotation pairs per head.
+//   q_seq    — per-batch-slot sequence length. Lets one kernel launch
+//              handle multiple prompts whose positions reset every q_seq
+//              rows (so each prompt sees positions 0..q_seq-1).
+// ============================================================================
 
 #include "kernel/kernels.cuh"
 
@@ -11,6 +60,10 @@
 
 namespace {
 
+// ----------------------------------------------------------------------------
+// Section 1 — Small helper. Turns a CUDA status code into a thrown
+// runtime_error that includes the source location and the failing call.
+// ----------------------------------------------------------------------------
 void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
                       int line) {
     if (err == cudaSuccess) return;
@@ -24,18 +77,27 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
 
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
-// rope_kernel — apply rotary embeddings in-place to x.
+// ============================================================================
+// Section 2 — rope_kernel: apply rotation in place on x.
+// ============================================================================
 //
-// Layout: x is row-major [seq_len, num_heads, head_dim]. For batched
+// Layout: x is row-major [seq_len, num_heads, head_dim]. In batched
 // generation seq_len = batch * q_seq and the RoPE position resets at the
-// start of each batch slot (row % q_seq). One thread handles exactly one
-// (row, head, pair_index) triple — fully parallel, no atomics, no syncs.
+// start of each batch slot — that's what the `row % q_seq` line below
+// handles, so one launch can process multiple prompts whose positions
+// each restart at 0.
 //
-// Why we rotate the (i, i+h_d/2) pair instead of (2i, 2i+1): this matches
-// the HuggingFace `rotate_half` convention used by the Llama 3 reference
-// implementation. Read x[i] and x[i+h_d/2] into a 2-vector, multiply by
-// the 2x2 rotation matrix, write back. In place is safe because both
-// stores depend only on values already loaded into local registers.
+// Parallelism: one thread handles exactly one (row, head, pair_index)
+// triple. Fully data-parallel — no atomics, no shared memory, no
+// __syncthreads. The kernel is bandwidth-bound, not compute-bound.
+//
+// In-place safety: both stores below depend only on values already loaded
+// into local registers (q_first, q_second), so writing x[i_first] and
+// x[i_second] in place can't race with the reads.
+//
+// (Pairing and base conventions are documented in the Credit and Common
+// pitfalls blocks at the top of this file — not repeated here.)
+// ============================================================================
 __global__ void rope_kernel(float *__restrict__ x,
                             const float *__restrict__ cos_table,
                             const float *__restrict__ sin_table,
@@ -46,10 +108,9 @@ __global__ void rope_kernel(float *__restrict__ x,
     int total = seq_len * num_heads * half_hd;
     if (idx >= total) return;
 
-    // Unpack the flat thread index into (row, head, pair_idx).
-    // pos = row % q_seq lets one launch handle multiple batch slots in
-    // a single tensor — the per-batch position counter resets every
-    // q_seq rows so each prompt sees positions 0..q_seq-1.
+    // Unpack the flat thread index into (row, head, pair_idx). The
+    // `row % q_seq` step is what resets the position counter at each
+    // batch-slot boundary (see Section 2 banner above for why).
     int pair_idx = idx % half_hd;
     int tmp = idx / half_hd;
     int head = tmp % num_heads;
@@ -75,8 +136,14 @@ __global__ void rope_kernel(float *__restrict__ x,
     x[i_second] = q_first * s + q_second * c;
 }
 
-// Host launcher for rope_kernel. q_seq < 0 is shorthand for "non-batched",
-// i.e. q_seq == seq_len so the position counter never wraps.
+// ============================================================================
+// Section 3 — gpu_rope: host entry for the device kernel.
+// ============================================================================
+//
+// Thin wrapper: pick block / grid shape, dispatch the kernel, surface
+// CUDA errors. q_seq < 0 is shorthand for "non-batched" — set q_seq to
+// seq_len so the position counter never wraps.
+// ============================================================================
 void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
               int seq_len, int num_heads, int head_dim, int q_seq) {
     int half_hd = head_dim / 2;
@@ -96,10 +163,21 @@ void gpu_rope(float *d_x, const float *d_cos, const float *d_sin,
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// Build cos/sin tables on the host. Sized [seq_len, h_d/2]; `base` is
-// passed in (always ROPE_BASE = 500000 in this project) so this stays
-// reusable for any RoPE-style model. Called once per inference pass and
-// uploaded to VRAM (video RAM), after which the device kernel is a table read.
+// ============================================================================
+// Section 4 — precompute_rope_table: host-side table builder.
+// ============================================================================
+//
+// Build cos/sin tables on the host, sized [seq_len, h_d/2]. `base` is a
+// parameter (always ROPE_BASE = 500000 for this project) so the function
+// stays reusable for any RoPE-style model. Called once per inference
+// pass and uploaded to VRAM (video RAM); after upload, rope_kernel just
+// reads from the precomputed tables instead of recomputing trig per call.
+//
+// Why precompute on the host instead of on-device: the table is small
+// (seq_len * h_d/2 floats), built once, and reused thousands of times by
+// the kernel. Host-side trig is plenty fast for a one-shot setup cost,
+// and keeping it off-device avoids a special-case kernel launch.
+// ============================================================================
 void precompute_rope_table(float *cos_out, float *sin_out,
                            int seq_len, int head_dim, float base) {
     int half_hd = head_dim / 2;

@@ -1,11 +1,28 @@
-// Residual addition kernel: a[i] += b[i], in place. One thread per element.
+// ============================================================================
+// residual.cu — Residual (skip) connection: a[i] += b[i], in place.
+// ============================================================================
 //
-// This single kernel implements both residual connections inside every
-// decoder block:
-//   X = X + attn_out          (after the attention sub-block)
-//   X = X + ffn_out           (after the FFN/feed-forward sub-block)
-// llm_part2 §3.1 requires both residuals; reusing one elementwise
-// kernel for both is the obvious move — the work shape is identical.
+// What it does: elementwise add b into a. Implements the two skip
+// connections inside every decoder block — the trick that lets gradients
+// (during training) and information (during inference) flow around each
+// sub-block instead of having to pass through it. Without these adds,
+// 32 layers of attention + FFN would amplify or attenuate signal until
+// the activations collapse or explode; the skips keep magnitudes stable.
+//
+// Where this kernel runs in the forward pass — twice per decoder block:
+//   (1) After attention:   X = X + attn_out
+//   (2) After FFN:         X = X + ffn_out
+//
+// One kernel handles both call sites: the work shape and arithmetic are
+// identical, so duplicating the code would gain nothing. Fusing this
+// into the matmul output stage would shave one launch + one HBM round
+// trip but obscures the per-layer skip structure.
+//
+// Read the file top-to-bottom — the layout matches execution order:
+//   Section 1: Small helper (CUDA error wrap).
+//   Section 2: residual_add_kernel — one thread per element, no reductions.
+//   Section 3: gpu_residual_add    — host entry point.
+// ============================================================================
 
 #include "kernel/kernels.cuh"
 
@@ -15,6 +32,10 @@
 
 namespace {
 
+// ----------------------------------------------------------------------------
+// Section 1 — Small helper. Turns a CUDA status code into a thrown
+// runtime_error that includes the source location and the failing call.
+// ----------------------------------------------------------------------------
 void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
                       int line) {
     if (err == cudaSuccess) return;
@@ -28,6 +49,13 @@ void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
 
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
+// ============================================================================
+// Section 2 — residual_add_kernel: one thread per element.
+// ============================================================================
+//
+// a[i] += b[i] for i in [0, count). Fully data-parallel, no reductions or
+// shared memory. The kernel is bandwidth-bound, not compute-bound.
+// ============================================================================
 __global__ void residual_add_kernel(float *__restrict__ a,
                                     const float *__restrict__ b,
                                     int count) {
@@ -37,6 +65,14 @@ __global__ void residual_add_kernel(float *__restrict__ a,
     a[i] += b[i];
 }
 
+// ============================================================================
+// Section 3 — gpu_residual_add: host entry point.
+// ============================================================================
+//
+// Thin wrapper: pick block / grid shape, dispatch the kernel, surface CUDA
+// errors. Both buffers live in device memory; `count` is their flat
+// element count (B * S * d for a layer's residual add).
+// ============================================================================
 void gpu_residual_add(float *d_a, const float *d_b, int count) {
     if (count <= 0) return;
 

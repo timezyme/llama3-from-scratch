@@ -3,9 +3,10 @@
 // The pattern is: each kernel lives in its own .cu file with a launch
 // helper named `gpu_<op>` that the C++ controller calls. The helper
 // takes care of grid/block sizing, error checking, and (for the
-// host-pointer variant) any host<->device copies. The controller in
-// inference.cu therefore stays in plain C++ and never has to write a
-// triple-chevron launch directly.
+// host-pointer variant) any host<->device copies. The controllers in
+// src/inference_layer.cu (forward_step) and src/inference_loop.cu
+// (orchestrator paths) therefore stay in plain C++ and never have to
+// write a triple-chevron launch directly.
 //
 // Two variants per matmul:
 //   gpu_matmul        — host pointers (used by the M1 grading test)

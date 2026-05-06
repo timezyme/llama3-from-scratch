@@ -1,11 +1,50 @@
-// Tiled GEMM (general matrix multiply): C = A * B, row-major FP32.
-// Satisfies llm_part1 §3.1.1 Step 5 with block tiling, shared-memory
-// reuse, and coalesced global loads. HBM means high-bandwidth memory.
+// ============================================================================
+// matmul.cu — Tiled GEMM (general matrix multiply): C = A * B.
+// ============================================================================
 //
-// Extra choices: double-buffered shared tiles, 8x8 per-thread register
-// accumulation, float4/BF16 vectorized loads, and +1 shared-memory
-// padding to avoid transpose-style bank conflicts. Tensor cores are not
-// used; that would require WMMA or mma.sync intrinsics and stricter tiles.
+// What it does: multiplies two large matrices on the GPU, fast. Workhorse
+// of every per-layer projection in the forward pass (Q, K, V, O, gate, up,
+// down all reduce to a call into one of the entry points below). The
+// final lm_head projection runs on the CPU instead (see
+// compute_lm_head_logits in src/inference_layer.cu) — it only needs the
+// last token's hidden vector, so the GEMM tiling here is overkill for
+// that one [V, d] * [d, 1] product. Two kernels live here: FP32 weights
+// (matmul_kernel) and BF16 weights widened to FP32 inline
+// (matmul_bf16_weight_kernel). Activations are always FP32, accumulation
+// is always FP32; only the weight storage dtype differs.
+//
+// Why it's fast: each weight byte is loaded from slow HBM (high-bandwidth
+// memory) once and reused many times from fast on-chip shared memory.
+// Without this trick, every thread would re-read the same row of A from
+// HBM thousands of times — we'd be memory-bandwidth-bound, not compute-
+// bound, and the kernel would run an order of magnitude slower.
+//
+// Read the file top-to-bottom — the layout matches execution flow:
+//   Section 1: Tile-size constants (BM, BN, BK, TM, TN) — the design choices
+//   Section 2: Small helpers (CUDA error wrap, BF16 -> FP32 widening)
+//   Section 3: matmul_kernel              — the FP32 workhorse, 4 phases A-D
+//   Section 4: matmul_bf16_weight_kernel  — same kernel, BF16 weights inline
+//   Section 5: gpu_matmul                 — host entry for the M1 grader
+//   Section 6: gpu_matmul_device          — device-pointer entry (forward pass)
+//   Section 7: gpu_matmul_device_bf16_weight — BF16 forward-pass entry
+//
+// Credit: the block-tiled / shared-memory-staged pattern follows the
+// canonical example in NVIDIA's CUDA Programming Guide (Chapter 3,
+// "Shared Memory") and the cuda-samples matrixMul reference. The
+// optimizations layered on top — double-buffered shared tiles, 8x8
+// per-thread register accumulation, float4/BF16 vectorized loads, and
+// +1 shared-memory padding to avoid bank conflicts — are this project's
+// choices and are explained inline at their first use below.
+//
+// Tensor cores are NOT used: that would require WMMA or mma.sync intrinsics
+// and stricter tile shapes than the ones we picked.
+//
+// Glossary (used throughout the comments below):
+//   HBM  — GPU global DRAM. Big (24 GB on L4), slow (~300 ns).
+//   Shared memory — per-block on-chip scratchpad. Tiny, fast (~10 ns).
+//   FMA  — fused multiply-add (one-cycle a*b+c on every CUDA core).
+//   SM   — streaming multiprocessor. The GPU's "core"; runs one block.
+// ============================================================================
 
 #include "kernel/kernels.cuh"
 
@@ -17,13 +56,19 @@
 
 namespace {
 
+// ----------------------------------------------------------------------------
+// Section 1 — Tile-size constants. The numbers below are deliberate: each
+// is justified by a reuse-math comment that explains how many FMAs every
+// loaded element feeds. Read the comments before the numbers.
+// ----------------------------------------------------------------------------
+
 // Block tile dimensions — each thread block owns a BM x BN region of C
-// and walks K in BK-wide tiles. 128x128 was chosen because, during one
-// rank-1 outer-product step, each smA element (at one row, one K-depth)
-// is reused by every output column in the block (BN = 128 reuses), and
-// each smB element is reused by every output row (BM = 128 reuses).
-// BK = 16 keeps two double-buffered shared tiles (smA + smB, including
-// the +1 padding) within typical per-block shared-memory budgets.
+// and walks K in BK-wide tiles. 128x128 was chosen because during one
+// rank-1 outer-product step each smA element (one row, one K-depth) is
+// reused by every output column in the block (BN = 128 reuses), and each
+// smB element is reused by every output row (BM = 128 reuses). BK = 16
+// keeps two double-buffered shared tiles (smA + smB, including the +1
+// padding) within typical per-block shared-memory budgets.
 constexpr int BM = 128;   // rows of C per block
 constexpr int BN = 128;   // cols of C per block
 constexpr int BK = 16;    // K-depth of each loaded tile
@@ -45,6 +90,12 @@ constexpr int SMA_LOADS_PER_THREAD = (BM * BK) / NUM_THREADS; // 8
 // smB: BK*BN = 2048 floats / 256 threads = 8 floats = 2 float4 loads per thread.
 constexpr int SMB_F4_PER_THREAD = (BK * BN) / (NUM_THREADS * 4); // 2
 constexpr int SMB_F4_PER_ROW = BN / 4; // 32 float4s per row of smB
+
+// ----------------------------------------------------------------------------
+// Section 2 — Small helpers. A CUDA error wrapper that turns a status code
+// into a thrown exception, plus a BF16 -> FP32 widener that runs on the
+// device. Nothing exotic; both are used by the kernels below.
+// ----------------------------------------------------------------------------
 
 // Format a CUDA error with source location and throw as runtime_error.
 void throw_cuda_error(cudaError_t err, const char *expr, const char *file,
@@ -81,28 +132,45 @@ __device__ __forceinline__ void load_bf16_quad(float *dst,
 
 #define CUDA_CHECK(expr) throw_cuda_error((expr), #expr, __FILE__, __LINE__)
 
-// FP32 GEMM kernel: C[M,N] = A[M,K] * B[K,N], all row-major.
-// Algorithm flow per block: prefetch tile 0, then for each K-tile —
-//   (a) prefetch the next tile into the alternate buffer,
-//   (b) run rank-1 outer-product accumulation on the current tile,
-//   (c) sync and swap buffers so the next iteration computes on what
-//       step (a) just loaded.
-// Each thread holds a private TM*TN register accumulator that sums every
-// K-tile's contribution to its output sub-tile.
+// ============================================================================
+// Section 3 — matmul_kernel: the FP32 workhorse.
+// ============================================================================
+//
+// One thread block computes one BM x BN (= 128 x 128) output tile of C and
+// walks across the K dimension in BK-wide (= 16) slabs. Inside the block,
+// 256 threads cooperate. Each thread owns a TM x TN (= 8 x 8 = 64) sub-tile
+// of C and holds its 64 running sums in registers.
+//
+// Phase outline — the labels are repeated inline below so a top-to-bottom
+// read of the function lets the comments narrate each step of the code:
+//   PHASE A — Allocate shared memory and zero the register accumulator.
+//   PHASE B — Prefetch K-tile 0 so the main loop has data on iteration 0.
+//   PHASE C — Main loop over K-tiles (double-buffered):
+//               (1) prefetch the NEXT tile into the alternate buffer,
+//               (2) compute on the CURRENT tile (rank-1 outer products
+//                   into the register accumulator),
+//               (3) __syncthreads(), then swap buffers.
+//             The SM overlaps the load in (1) with the FMAs in (2)
+//             because they read/write different shared-memory buffers.
+//   PHASE D — Write each thread's 64 accumulators back to C.
+// ============================================================================
 __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
                               int K, int N) {
-    // Double-buffered tiles in shared memory. The leading dimension `2`
-    // is the buffer index that ping-pongs between tiles to overlap loads
-    // with compute. The trailing `+1` pads the inner dimension so threads
-    // accessing the same logical column hit different banks during the
-    // outer-product loop (avoids 32-way bank-conflict serialization).
+    // ---- PHASE A: shared-memory buffers + register accumulator ----------
+    // Two buffers per matrix so we can ping-pong (double-buffering). The
+    // leading [2] is the buffer index. The trailing +1 is column padding
+    // to dodge bank conflicts: shared memory has 32 banks, so without the
+    // +1 every thread reading the same logical column would hit one bank
+    // and serialize 32-way. Padding pushes them onto different banks.
     __shared__ float smA[2][BM][BK + 1];
     __shared__ float smB[2][BK][BN + 1];
 
-    const int tid = threadIdx.y * BLOCK_X + threadIdx.x; // flat thread ID in block
-    const int num_tiles = (K + BK - 1) / BK;             // number of K-tiles
+    const int tid = threadIdx.y * BLOCK_X + threadIdx.x; // flat thread id (0..255)
+    const int num_tiles = (K + BK - 1) / BK;             // K-tiles to walk
 
-    // Per-thread accumulators — TM x TN = 64 floats held in registers.
+    // Per-thread register accumulator: 64 floats, one per output element
+    // this thread is responsible for. Lives in registers, not memory —
+    // that's why the inner FMA loop in PHASE C is so fast.
     float acc[TM][TN];
     #pragma unroll
     for (int i = 0; i < TM; ++i)
@@ -110,9 +178,11 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
         for (int j = 0; j < TN; ++j)
             acc[i][j] = 0.0f;
 
-    // === Prefetch first tile (tile 0) into buffer 0 ===
-    // We do this once before the main loop so iteration 0 already has data
-    // in `cur` to compute on while it prefetches tile 1 into `nxt`.
+    // ---- PHASE B: prefetch K-tile 0 into buffer 0 -----------------------
+    // We load the very first tile BEFORE entering the main loop so that
+    // iteration 0 already has data in `cur` to compute on while it
+    // prefetches tile 1 into `nxt`. This is what kicks off the
+    // load-and-compute overlap throughout the main loop.
 
     // Cooperatively load smA: each thread loads 8 scalar elements from A.
     // smA is BM*BK = 2048 floats; 256 threads * 8 floats = 2048 — every
@@ -141,7 +211,6 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
         int gr = sr;                         // global row in B (tile 0)
         int gc = blockIdx.x * BN + sc;      // global col in B
         int idx = gr * N + gc;
-        // Use vectorized float4 load when aligned and in-bounds; scalar fallback otherwise.
         if (gr < K && gc + 3 < N && (idx % 4 == 0)) {
             float4 val = *reinterpret_cast<const float4 *>(&B[idx]);
             smB[0][sr][sc]     = val.x;
@@ -157,25 +226,25 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
         }
     }
 
-    __syncthreads();
+    __syncthreads(); // make sure tile 0 is fully written before anyone reads it
 
-    // === Main loop: iterate over K-tiles with double buffering ===
-    // Each iteration:
-    //   1. Prefetch the NEXT tile into the alternate buffer `nxt`. This
-    //      overlaps HBM loads with FMA (fused multiply-add) work on the
-    //      current tile on the SM (streaming multiprocessor).
-    //   2. Compute on the CURRENT tile in `cur`. This is where the work
-    //      actually happens — register-level outer products that produce
-    //      TM*TN partial sums per thread.
-    //   3. __syncthreads() to make sure every thread has finished reading
-    //      `cur` before we reuse that buffer in a future iteration. Then
-    //      swap so next iteration's compute sees what step 1 just loaded.
+    // ---- PHASE C: main loop over K-tiles, double-buffered ---------------
+    // Each iteration does THREE things, in this order:
+    //   (1) Prefetch the NEXT tile into buffer `nxt`. The SM issues these
+    //       HBM loads concurrently with the FMAs in step (2) — that
+    //       overlap is the entire point of double-buffering.
+    //   (2) Compute on the CURRENT tile in buffer `cur`: pull values into
+    //       registers and run a TM x TN outer product, accumulating into
+    //       acc[][]. This is where the FLOPs actually happen.
+    //   (3) Barrier, then swap. Threads must finish reading `cur` before
+    //       any future iteration overwrites it. After the swap, what we
+    //       just loaded into `nxt` becomes the next iteration's `cur`.
 
-    int cur = 0; // current buffer index (0 or 1)
+    int cur = 0; // index of the buffer we'll compute on this iteration
     for (int tile = 0; tile < num_tiles; ++tile) {
-        int nxt = 1 - cur; // alternate buffer for prefetching
+        int nxt = 1 - cur; // the OTHER buffer — that's where the prefetch goes
 
-        // --- Prefetch next tile into buffer `nxt` (if not the last tile) ---
+        // ---- (1) Prefetch next tile into `nxt` (skip on the last iter) -----
         if (tile + 1 < num_tiles) {
             int next_tile = tile + 1;
 
@@ -217,12 +286,14 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
             }
         }
 
-        // --- Compute on current tile: rank-1 outer product accumulation ---
-        // For each k in [0, BK): pull this thread's TM rows of smA at depth
-        // k into registers (a_reg) and its TN cols of smB at depth k into
-        // registers (b_reg), then run a TM*TN FMA grid. This is the core
-        // arithmetic-intensity boost: BK=16 sweeps produce 16*64 = 1024
-        // FMAs per thread, all sourced from registers.
+        // ---- (2) Compute on the CURRENT tile: rank-1 outer products -------
+        // For each depth k in [0, BK): pull this thread's TM values from
+        // smA[cur] (one column of its rows) into a_reg, and its TN values
+        // from smB[cur] (one row of its columns) into b_reg. Then do a
+        // TM x TN grid of FMAs, all from registers — no shared/global
+        // loads inside the inner loop. Each register load feeds 8 FMAs
+        // (column reuse), and each row load feeds 8 FMAs (row reuse).
+        // 16 depths * 64 FMAs = 1024 FMAs per thread per tile.
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
             // This thread's TM values from its rows of smA (column k).
@@ -245,12 +316,15 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
                     acc[tm][tn] += a_reg[tm] * b_reg[tn];
         }
 
-        __syncthreads(); // ensure all threads are done reading `cur` before swapping
-        cur = nxt;       // swap buffers: next iteration reads from what we just loaded
+        // ---- (3) Barrier and swap buffers ---------------------------------
+        __syncthreads(); // every thread must finish reading `cur` before reuse
+        cur = nxt;       // what we just prefetched is the next iteration's input
     }
 
-    // === Write back TM x TN accumulated results to global memory C ===
-    // Bounds-check each element since the tile may extend past M or N.
+    // ---- PHASE D: write each thread's 64 accumulators back to C ---------
+    // Bounds-check each element — the block's tile may extend past the
+    // real matrix edges, so the last block in each direction can have
+    // some out-of-range outputs to skip.
     #pragma unroll
     for (int tm = 0; tm < TM; ++tm) {
         int gr = blockIdx.y * BM + threadIdx.y * TM + tm;
@@ -266,13 +340,27 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     }
 }
 
-// FP32 activations * BF16 weights: C[M,N] = A[M,K] * B_bf16[K,N].
-// Same tiling as matmul_kernel, but smB is loaded by widening BF16 bits
-// to FP32 inline. Keeping resident weights in BF16 halves weight bytes
-// read from HBM; accumulation remains FP32.
+// ============================================================================
+// Section 4 — matmul_bf16_weight_kernel: same shape, BF16 weights.
+// ============================================================================
+//
+// Identical phase structure (A, B, C, D) to Section 3 above. The only
+// difference is that B is laid out as raw BF16 bits (uint16_t), which
+// halves the HBM bytes per weight load. Each load widens 4 BF16 values to
+// 4 FP32 values inline (load_bf16_quad) before they go into smB. FP32
+// accumulation in `acc[][]` is unchanged — only the storage dtype of
+// the weight matrix shrinks.
+//
+// Why this kernel exists: it's how the resident-weights inference path
+// fits 8B params in 24 GB VRAM. 8B params * 2 bytes = 16 GB resident;
+// FP32 would be 32 GB and not fit on an L4.
+// ============================================================================
 __global__ void matmul_bf16_weight_kernel(const float *A,
                                           const uint16_t *B_bf16,
                                           float *C, int M, int K, int N) {
+    // ---- PHASE A: shared-memory buffers + register accumulator ----------
+    // Same layout as Section 3 — smB still stores FP32, the BF16 -> FP32
+    // widening happens at load time before each value enters smB.
     __shared__ float smA[2][BM][BK + 1];
     __shared__ float smB[2][BK][BN + 1];
 
@@ -286,6 +374,8 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
         for (int j = 0; j < TN; ++j)
             acc[i][j] = 0.0f;
 
+    // ---- PHASE B: prefetch K-tile 0 into buffer 0 -----------------------
+    // smA load is identical to the FP32 kernel — A is FP32 in both paths.
     #pragma unroll
     for (int i = 0; i < SMA_LOADS_PER_THREAD; ++i) {
         int elem = tid + i * NUM_THREADS;
@@ -296,8 +386,9 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
         smA[0][sr][sc] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
     }
 
-    // Cooperatively load smB. Each thread reads two aligned uint2 chunks
-    // (8 BF16 values total) when possible; scalar fallback handles edge tiles.
+    // smB load reads BF16 bits and widens to FP32 inline. Each thread
+    // reads two aligned uint2 chunks (8 BF16 values = 4 + 4) when possible;
+    // scalar fallback handles edge tiles.
     #pragma unroll
     for (int i = 0; i < SMB_F4_PER_THREAD; ++i) {
         int f4 = tid + i * NUM_THREADS;
@@ -322,10 +413,15 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
 
     __syncthreads();
 
+    // ---- PHASE C: main loop over K-tiles, double-buffered ---------------
+    // Same three-step body as Section 3: prefetch, compute, barrier+swap.
+    // The only difference is in step (1)'s smB load, which uses the BF16
+    // widening helpers instead of a plain float4 cast.
     int cur = 0;
     for (int tile = 0; tile < num_tiles; ++tile) {
         int nxt = 1 - cur;
 
+        // ---- (1) Prefetch next tile into `nxt` (skip on the last iter) -----
         if (tile + 1 < num_tiles) {
             int next_tile = tile + 1;
 
@@ -363,6 +459,10 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
             }
         }
 
+        // ---- (2) Compute on the CURRENT tile: rank-1 outer products -------
+        // Identical to Section 3 — by the time values enter smB they are
+        // already FP32, so the inner FMA loop has no idea the weights came
+        // from BF16 storage.
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
             float a_reg[TM];
@@ -382,10 +482,12 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
                     acc[tm][tn] += a_reg[tm] * b_reg[tn];
         }
 
+        // ---- (3) Barrier and swap buffers ---------------------------------
         __syncthreads();
         cur = nxt;
     }
 
+    // ---- PHASE D: write each thread's 64 accumulators back to C ---------
     #pragma unroll
     for (int tm = 0; tm < TM; ++tm) {
         int gr = blockIdx.y * BM + threadIdx.y * TM + tm;
@@ -401,11 +503,25 @@ __global__ void matmul_bf16_weight_kernel(const float *A,
     }
 }
 
-// Host entry used by the M1 grading tests (TestAPI::matmul).
-// Owns the full host->device->host trip: cudaMalloc, copy A and B in,
-// launch the kernel, copy C out, free everything. Exception-safe:
-// device buffers are freed on every path so a CUDA error mid-call does
-// not leak GPU memory.
+// ============================================================================
+// Section 5 — gpu_matmul: host entry used by the M1 grading tests.
+// ============================================================================
+//
+// This is what TestAPI::matmul calls: pass in plain host pointers and get
+// host pointers back. The function owns the full round trip:
+//   (1) cudaMalloc d_A, d_B, d_C
+//   (2) cudaMemcpy A and B host -> device
+//   (3) launch matmul_kernel
+//   (4) cudaMemcpy C device -> host
+//   (5) cudaFree everything
+//
+// Exception-safe: if any step throws, the catch block frees whatever was
+// allocated so a mid-call error does not leak GPU memory.
+//
+// We do NOT use this path inside the forward pass — every layer's inputs
+// are already on the device, so paying for cudaMemcpy each call would
+// waste PCIe bandwidth. See Section 6 for the device-pointer entry.
+// ============================================================================
 void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
                 int N) {
     if (M < 0 || K < 0 || N < 0) {
@@ -479,10 +595,19 @@ void gpu_matmul(const float *A, const float *B, float *C, int M, int K,
     CUDA_CHECK(free_all());
 }
 
-// Device-pointer entry used inside the forward pass. Skips the H2D/D2H
-// copies because the inference pipeline already has Q, K, V, X, etc. in
-// VRAM (video RAM) — every redundant copy would be wasted PCIe (Peripheral
-// Component Interconnect Express) bandwidth. Caller owns the d_* buffers.
+// ============================================================================
+// Section 6 — gpu_matmul_device: device-pointer entry for the forward pass.
+// ============================================================================
+//
+// Same kernel as Section 5, but the caller has already put its tensors in
+// VRAM (Q, K, V, X, layer norms, etc. all live on the GPU during the
+// forward pass). So we skip the H2D and D2H copies — those would be wasted
+// PCIe (Peripheral Component Interconnect Express) traffic. Just launch
+// the kernel and return. Caller owns the d_* buffers.
+//
+// This is the entry point used by every projection inside the forward pass
+// when running with FP32 weights.
+// ============================================================================
 void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
                        int M, int K, int N) {
     if (M < 0 || K < 0 || N < 0) {
@@ -501,9 +626,15 @@ void gpu_matmul_device(const float *d_A, const float *d_B, float *d_C,
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// Same device-pointer entry as gpu_matmul_device but for the BF16-weight
-// kernel. Used for every per-layer projection (Q/K/V/O/gate/up/down) in
-// the resident-weights inference path so weight bytes stay BF16 in VRAM.
+// ============================================================================
+// Section 7 — gpu_matmul_device_bf16_weight: BF16-weight forward entry.
+// ============================================================================
+//
+// Same shape as Section 6, but dispatches to the BF16-weight kernel from
+// Section 4. This is the hot path for the resident-weights forward pass:
+// every Q/K/V/O/gate/up/down projection in every layer goes through here
+// so weight bytes stay BF16 in VRAM and HBM bandwidth halves.
+// ============================================================================
 void gpu_matmul_device_bf16_weight(const float *d_A,
                                    const uint16_t *d_B_bf16,
                                    float *d_C, int M, int K, int N) {
