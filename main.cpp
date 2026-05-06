@@ -15,9 +15,10 @@
 //   ./bin/llm "prompt"                              (single greedy token)
 //   ./bin/llm --max-tokens N "prompt"               (N tokens, KV cache)
 //   ./bin/llm --prompt "p1" --prompt "p2" --max-tokens N    (B>1 batch)
-//   ./bin/llm --interactive [--max-tokens N]        (REPL on stdin)
+//   ./bin/llm --interactive --max-tokens N         (REPL on stdin, N >= 2)
 
 #include "config.h"
+#include "inference.h"
 #include "tokenizer.h"
 
 #include <cstdlib>
@@ -26,9 +27,6 @@
 #include <string>
 #include <vector>
 
-#ifdef CUDA_ENABLED
-#include "inference.h"
-
 namespace {
 
 // Print CLI usage text to stderr. Called for `--help` and on argument errors.
@@ -36,10 +34,11 @@ void print_usage(const char *argv0) {
     std::fprintf(stderr,
                  "Usage: %s [--max-tokens N] \"prompt\"\n"
                  "       %s [--max-tokens N] --prompt P [--prompt P ...]\n"
-                 "       %s --interactive [--max-tokens N]\n"
+                 "       %s --interactive --max-tokens N\n"
                  "  --max-tokens N   generate up to N tokens (default 1)\n"
                  "  --prompt P       add one prompt to a batch (repeatable)\n"
-                 "  --interactive    REPL mode; load resident weights once, "
+                 "  --interactive    REPL mode (requires --max-tokens >= 2); "
+                 "load resident weights once, "
                  "read prompts from stdin (Ctrl-D or 'exit' to quit)\n",
                  argv0,
                  argv0,
@@ -47,17 +46,8 @@ void print_usage(const char *argv0) {
 }
 
 } // namespace
-#endif
 
 int main(int argc, char *argv[]) {
-#ifndef CUDA_ENABLED
-    // No NVIDIA GPU detected at build time, so the inference path is absent.
-    // We refuse to run rather than silently producing garbage on the CPU.
-    (void)argc;
-    (void)argv;
-    std::cerr << "Error: inference requires CUDA (nvcc not found at build time)\n";
-    return 1;
-#else
     // Defaults: one prompt, one generated token, no batch, no REPL.
     int max_tokens = 1;
     bool interactive = false;
@@ -109,6 +99,13 @@ int main(int argc, char *argv[]) {
                          "pipe them via stdin\n");
             return 1;
         }
+        if (max_tokens < 2) {
+            std::fprintf(stderr,
+                         "Error: --interactive requires --max-tokens >= 2 "
+                         "(single-token mode does not benefit from resident "
+                         "weights; use ./bin/llm \"prompt\" instead)\n");
+            return 1;
+        }
         ModelWeights weights(DUMP_DIR);                  // host-side (CPU) copy
         DeviceModelWeights resident_weights(DUMP_DIR);   // device-side (GPU) copy
 
@@ -146,8 +143,7 @@ int main(int argc, char *argv[]) {
 
     // Resolve prompts. The two intake forms (positional vs --prompt) are
     // mutually exclusive: mixing them is almost always a typo. With nothing
-    // supplied we fall back to a default so `./bin/llm` alone still does
-    // something useful (handy as a smoke test).
+    // supplied we print usage and exit 1.
     if (!prompts.empty() && !positional_prompts.empty()) {
         std::fprintf(stderr,
                      "Error: use either positional prompt or --prompt, not both\n");
@@ -155,7 +151,8 @@ int main(int argc, char *argv[]) {
     }
     if (prompts.empty()) {
         if (positional_prompts.empty()) {
-            prompts.push_back("Hello world");
+            print_usage(argv[0]);
+            return 1;
         } else if (positional_prompts.size() == 1) {
             prompts.push_back(positional_prompts[0]);
         } else {
@@ -241,5 +238,4 @@ int main(int argc, char *argv[]) {
     }
 
     return 0;
-#endif
 }

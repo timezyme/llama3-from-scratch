@@ -2,20 +2,20 @@
 
 From-scratch Llama 3 8B Instruct inference in C++17/CUDA. No ML framework dependencies at runtime. Built on the [CS265 MLSys starter project](https://github.com/qtwang/CS265-mlsys-project).
 
-The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. A CPU matmul fallback builds when `nvcc` is unavailable. A Python toolchain downloads and converts the model weights offline.
+The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMSNorm, RoPE positional encoding, grouped-query attention, SwiGLU FFN, and output projection via a separate lm_head weight matrix. CUDA kernels handle matrix multiplication (double-buffered tiled GEMM), normalization, and activation functions. Building `bin/llm` requires `nvcc`; the M1 `bin/tests` target still builds CPU-only via the `matmul_cpu` fallback. A Python toolchain downloads and converts the model weights offline.
 
 ## Notes for graders
 
 - **Required path uses FP32** (M1 grading tests via `bin/tests` 1..7, single-token inference). All 7 M1 tests pass on L4 (sm_89).
 - **Multi-token path uses BF16** for resident weights so all ~14.5 GB of Llama 3 8B can stay on L4's 24 GB VRAM. FP32 residency would need 32 GB. Per the discussion-board policy on BF16, please apply the relaxed-epsilon allowance to any internal M2-3 tests whose tolerances were written for FP32 reference values.
 - **Conclusive end-to-end test (`docs/assignment/llm_part2.md` §3.1 Step 6)**: `./bin/llm --max-tokens 8 "What is the capital of California?"` produces `"The capital of California is Sacramento."` (token-by-token argmax decode + EOT). Verified on L4 in this branch.
-- **Live demo:** `./scripts/demo-start.sh` brings up the L4, SSHes in, and drops into an interactive REPL (`./bin/llm --interactive`). Resident BF16 weights load once (~3 min); each subsequent prompt answers in ~3s. After the demo, `./scripts/demo-stop.sh` stops the VM.
+- **Live demo:** `./scripts/demo-start.sh` brings up the L4, SSHes in, and drops into an interactive REPL (`./bin/llm --interactive --max-tokens 32`). Resident BF16 weights load once (~3 min); each subsequent prompt answers in ~3s. After the demo, `./scripts/demo-stop.sh` stops the VM.
 - **Extensions shipped**: KV cache + resident weights, and B>1 batched generation. Both ship with internal parity tests; see `tests/test_m2m3.cpp` (`batched_b2_distinct_parity`, etc.).
 
 ## Quick start
 
 ```bash
-# Build (CPU-only if nvcc is not found)
+# Build (requires nvcc for bin/llm; bin/tests builds CPU-only)
 make                    # release build → bin/llm
 make tests              # M1 test binary → bin/tests
 make tests_m2m3         # M2-3 test binary → bin/tests_m2m3 (CUDA required)
@@ -76,7 +76,7 @@ echo "HUGGINGFACE_TOKEN=hf_..." > .env
 After capturing the custom image, future `provision_l4.sh` runs boot in ~60s with everything pre-baked. The demo wrapper scripts auto-detect the VM zone:
 
 ```bash
-./scripts/demo-start.sh 32                     # start VM, SSH in, drop into bin/llm --interactive
+./scripts/demo-start.sh 32                     # start VM, SSH in, drop into bin/llm --interactive --max-tokens 32
 ./scripts/demo-stop.sh                         # stop the VM after the demo
 ```
 
@@ -163,7 +163,7 @@ tools/
   test_l4.sh             # Push source, build, run M1+M2-3 lane on L4
   create_custom_image.sh # Snapshot warm L4 boot disk for fast (~60s) re-provision
 scripts/
-  demo-start.sh          # Auto-detect zone, start L4, SSH into bin/llm --interactive
+  demo-start.sh          # Auto-detect zone, start L4, SSH into bin/llm --interactive --max-tokens N
   demo-stop.sh           # Auto-detect zone, stop the L4 VM
   run_tests.sh           # Local test runner
 ```

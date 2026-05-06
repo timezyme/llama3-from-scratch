@@ -53,18 +53,26 @@ ifeq ($(CUDA_ENABLED),1)
                        $(BUILD_DIR)/kv_cache.o \
                        $(CUDA_KERNEL_OBJECTS)
   OBJECTS += $(MAIN_CUDA_OBJECTS)
-else
-  MATMUL_OBJECT := $(BUILD_DIR)/matmul_cpu.o
-  OBJECTS += $(MATMUL_OBJECT)
 endif
 
 DEPS := $(OBJECTS:.o=.d)
+
+ifeq ($(CUDA_ENABLED),1)
 
 all: $(BIN_DIR)/$(TARGET)
 $(BIN_DIR)/$(TARGET): $(OBJECTS) | $(BIN_DIR)
 	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
 $(BUILD_DIR)/main.o: main.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+else
+
+all:
+	@echo "ERROR: bin/llm requires CUDA (nvcc not found)"
+	@exit 1
+
+endif
+
 $(BUILD_DIR)/tokenizer_bpe.o: $(SRC_DIR)/tokenizer_bpe.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 $(BUILD_DIR)/loader.o: $(SRC_DIR)/loader.cpp | $(BUILD_DIR)
@@ -93,7 +101,7 @@ clean:
 .PHONY: run
 
 run: all
-	./$(BIN_DIR)/$(TARGET)
+	./$(BIN_DIR)/$(TARGET) "Hello world"
 -include $(DEPS)
 
 # ------------------------------------------------------------
