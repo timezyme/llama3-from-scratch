@@ -36,12 +36,17 @@
 
 #include <cuda_runtime.h>
 
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                        \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess)                                                \
-            throw std::runtime_error(std::string("CUDA error: ") +            \
-                                     cudaGetErrorString(err));                  \
+// Wrap a CUDA runtime call and turn failures into C++ exceptions. This keeps
+// allocation/copy call sites readable while still surfacing the CUDA error
+// string immediately. Keep the trailing backslashes: they make the do/while
+// block part of the macro expansion.
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = (call);                                           \
+        if (err != cudaSuccess) {                                           \
+            throw std::runtime_error(std::string("CUDA error: ") +          \
+                                     cudaGetErrorString(err));              \
+        }                                                                   \
     } while (0)
 
 namespace {
