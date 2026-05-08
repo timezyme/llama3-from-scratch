@@ -1,83 +1,57 @@
----
+## Step 16: Argmax and Decode
 
-## Step 16: Argmax + Decode
+This step is needed because logits are only scores, not text. Argmax chooses one
+token ID from those scores, and decode turns that ID into the text the user
+actually sees.
 
-**Files:** `src/inference_loop.cu:179-180` (argmax), `src/tokenizer_bpe.cpp:40-49` (decode)
-**Where in the pipeline:** The very end. lm_head produced 128,256 logits — one score per vocabulary token. We pick the winner and convert it back to text.
+### Main idea
 
-### High-level picture
+After `lm_head`, the model has one logit per vocabulary token:
 
-Two operations:
-
-```
-token_id = argmax(logits)              ← pick the highest-scoring token (line 179-180)
-text = tokenizer.decode([token_id])    ← convert ID back to string (line 40-49)
+```text
+logits: [128256]
 ```
 
-That's it. The entire 32-layer forward pass bottlenecks down to one `std::max_element` call over 128,256 floats and one table lookup.
+Greedy decoding means: pick the largest logit. The first generated token uses
+`std::max_element` at `src/inference_loop.cu:180`.
 
-### Argmax (greedy decoding)
+There is no softmax here. Softmax would turn logits into probabilities, but it
+would not change which logit is largest:
 
-Line 179-180:
-```cpp
-next_ids[b] = static_cast<int>(
-    std::max_element(logits.begin(), logits.end()) - logits.begin());
+```text
+argmax(logits) == argmax(softmax(logits))
 ```
 
-This is **greedy decoding** — always pick the token with the highest logit. No randomness, no temperature, no top-k/top-p sampling. The assignment requires greedy decoding; sampling strategies are out of scope.
+So greedy decoding can skip softmax and get the same token ID.
 
-The result is a single integer: the token ID of the predicted next word (or word-piece).
+For multi-token generation, that chosen ID becomes the next input token. The
+decode loop chooses later tokens the same way at `src/inference_loop.cu:220`,
+then marks the sequence done if the new ID is `EOT_ID`.
 
-### Decode (token ID -> text)
+### Where it fits
 
-`BPETokenizer::decode()` at `tokenizer_bpe.cpp:40-49` reverses the encoding:
-- Look up the token ID in `id2tok` to get the raw byte string (line 45-46)
-- Skip any special tokens (BOS, EOT, headers) — they're control markers, not user-visible text (line 43-44)
+The token ID is still just an integer. To print text, the program calls
+`decode_token` at `src/inference.cu:88`.
 
-For example, token ID `12366` maps to the byte string `" Paris"` (with the leading space, since BPE tokens often include whitespace).
+That function uses the BPE tokenizer. BPE means byte-pair encoding: common byte
+patterns get stored as reusable token pieces. A decoded token may already include
+a leading space, so the program should not add its own extra space.
 
-### The autoregressive loop
+`BPETokenizer::decode` starts at `src/tokenizer_bpe.cpp:40`. It skips special
+IDs like beginning-of-text and end-of-turn, then appends the normal token piece
+from `id2tok`.
 
-Step 16 completes one token generation. For multi-token generation (paths 2-4 from step 1), the newly generated token ID feeds back into the pipeline:
+Special IDs are control markers for the chat template. They help the model
+understand roles and turns, but they are not user-visible answer text.
 
-```
-token_id → embed → forward_step(q_seq=1) → lm_head → argmax → next token_id → ...
-```
+### Review question
 
-Each decode step only processes the *one new token* (q_seq=1), because the KV cache already holds the K/V values from all previous positions. The loop repeats until either `max_new_tokens` is reached or the model emits `EOT_ID` (128009) — its way of saying "I'm done answering."
-
-This is visible in `inference_loop.cu:187-209`: a `for` loop that embeds one token, calls `forward_step` with `q_seq=1`, runs lm_head, does argmax, and checks for EOT.
-
-### The full pipeline, end to end
-
-You can now trace one token through the entire system:
-
-```
-"What is 2+2?" → chat template → BPE encode → embed [s, 4096]
-→ 32x { RMSNorm → QKV → RoPE → GQA Attention → O proj → residual
-        → RMSNorm → SwiGLU FFN → residual }
-→ final RMSNorm → extract last token → lm_head [128256] → argmax → token 578
-→ decode → " The"
-→ feed back, repeat...
-```
-
----
-
-**TA-style question:**
-
-Greedy decoding always picks the single highest-probability token. Why might this not always produce the best overall response, and what alternative decoding strategies exist? (This is a conceptual question — no code in this project implements alternatives.)
+Why does greedy decoding skip softmax, and why does decode skip special tokens?
 
 **answer**
 
-Greedy decoding is locally optimal but not globally optimal. Picking the best token at each step can paint the model into a corner — the highest-probability first word might lead to a worse overall sentence than a slightly less likely first word that opens up better continuations. It's like chess: the best immediate move isn't always the best strategy.
+Greedy decoding only needs the index of the largest score. Softmax changes the
+scale of the scores, but not their order, so the largest logit stays the winner.
 
-Alternatives:
-
-- **Beam search**: Track the top-k partial sequences in parallel, scoring each full path. More compute, but finds higher-probability sequences overall.
-- **Temperature sampling**: Divide logits by a temperature T before softmax. T<1 sharpens the distribution (more deterministic), T>1 flattens it (more creative/random).
-- **Top-k sampling**: Zero out all logits except the top k candidates, then sample from the remainder. Prevents the model from picking extremely unlikely tokens.
-- **Top-p (nucleus) sampling**: Keep the smallest set of tokens whose cumulative probability exceeds p (e.g., 0.95), then sample. Adapts the candidate set size dynamically — narrow when the model is confident, wide when it's uncertain.
-
-For this project, greedy is correct and sufficient — the assignment only asks for deterministic one-token-at-a-time generation.
-
----
+Decode skips special tokens because they are control markers, not answer text.
+Printing them would leak chat-template scaffolding into the output.

@@ -1,58 +1,63 @@
----
-
 ## Step 14: 32-Layer Loop
 
-**File:** `src/inference_layer.cu:261-438`
-**Where in the pipeline:** This is the outermost structure of the GPU compute. Steps 8-13 described one decoder block — step 14 is the `for` loop that runs it 32 times with different weights each time.
+The 32-layer loop is needed because the model was trained as 32 decoder blocks
+in a fixed order. Inference has to run all 32 blocks in that same order, using
+the learned weights for each layer.
 
-### High-level picture
+### Main idea
 
-Line 261 is a simple loop:
+One decoder block is:
 
-```cpp
-for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+```text
+RMSNorm -> Q/K/V -> RoPE -> attention -> O projection -> residual
+        -> RMSNorm -> FFN -> residual
 ```
 
-Each iteration runs the complete decoder block from steps 8-13: RMSNorm #1 -> Q/K/V -> RoPE -> attention -> O proj -> residual #1 -> RMSNorm #2 -> FFN -> residual #2. The output `X` from layer N becomes the input to layer N+1. Same shape (`[s, 4096]`) in and out — 32 layers of refinement on the same representation.
+Llama 3 8B has 32 decoder blocks. The constant is `NUM_LAYERS` at
+`config.h:29`.
 
-What changes between layers: **the weights**. Each layer has its own 9 tensors (2 norms, 4 attention projections, 3 FFN projections). The scratch buffers (`d_X`, `d_Xnorm`, `d_Q`, `d_attn`, `d_gate`, `d_up`, `d_ffn`) are allocated once before the loop (lines 219-236) and reused across all 32 iterations.
+The loop starts at `src/inference_layer.cu:261`. Each pass takes the current
+`X`, runs one full decoder block, and writes the updated result back into `X`.
+So layer 0 produces the input to layer 1, layer 1 produces the input to layer 2,
+and so on.
 
-### Two weight delivery modes
+The code sequence stays the same each time. The weights change.
 
-The loop body branches on `resident_weights != nullptr`:
+Each layer has its own 9 learned tensors:
 
-**Streaming path** (lines 271-304, 435-438): Load this layer's FP32 weights from disk into CPU RAM (`weights.load_layer(layer)`), upload them to GPU via `cudaMemcpy`, run the decoder block, then `weights.unload_layer(layer)` to free the CPU copy. Only one layer's weights live in memory at a time. Slow (~seconds per layer due to PCIe transfers), but works within any memory budget.
+```text
+2 RMSNorm weights
+4 attention projection weights
+3 FFN projection weights
+```
 
-**Resident path** (line 270): `resident_weights->load_layer(layer)` returns pointers to BF16 weights already sitting in GPU VRAM. No copying, no disk I/O — just use them. All 32 layers fit simultaneously in the L4's 24 GB VRAM (~16 GB total in BF16).
+Using layer 0's weights for every pass would still run, but it would be the
+wrong model.
 
-### Buffer reuse strategy
+### Where it fits
 
-The forward_step function allocates about 15 device buffers at the top (lines 219-250) and frees them all at the bottom (lines 463-469). Within the 32-iteration loop, every buffer is overwritten each iteration — no accumulation across layers except `d_X` itself, which carries the evolving hidden state.
+Before the loop, `X` holds the token embeddings for this pass.
 
-The `AttentionScratch` struct (line 240-250) holds 5 per-head temporary buffers (Q_i, K_g^T, V_g, S, O_i) that are reused across all 32 layers x 32 heads = 1,024 attention head computations per forward pass.
+Inside the loop, the code chooses the current layer's weights. The resident path
+gets GPU-resident BF16 weights at `src/inference_layer.cu:270`. The streaming
+path loads that layer's CPU weights at `src/inference_layer.cu:273`, copies them
+to the GPU, then unloads the CPU copy after the layer finishes.
 
-### KV cache interaction
+The scratch buffers do not get reallocated for every layer. Buffers like `d_X`,
+`d_Xnorm`, `d_Q`, `d_attn`, `d_gate`, and `d_ffn` are allocated before the loop
+and reused.
 
-Each layer writes its K and V projections into the KV cache at the layer's designated slot. After the loop exits, `cache.advance(q_seq)` (line 442) updates the cache length so the next decode step knows how many past tokens are stored. This is the mechanism that connects one forward pass to the next during autoregressive generation.
+After all 32 layers finish, the KV cache length advances, and the final RMSNorm
+runs next.
 
-### TA-scrutiny items
+### Review question
 
-- **Per-layer weights**: Each layer has distinct weight tensors. A common bug is accidentally using layer 0's weights for all 32 layers.
-- **Two RMSNorm gammas per layer**: The loop loads `input_layernorm` (line 280-281) and `post_attn_layernorm` (line 395-398) separately. Swapping them is a silent correctness bug.
-- **Buffer reuse**: Scratch buffers are allocated once and overwritten each iteration. This is efficient but means you can't inspect layer 5's intermediate Q after layer 6 has already overwritten the buffer.
-
----
-
-**TA-style question:**
-
-On the streaming path, each layer requires uploading ~450 MB of FP32 weights over PCIe (9 tensors totaling ~112M parameters x 4 bytes). For 32 layers, that's ~14.4 GB of PCIe transfers per forward pass. On the resident BF16 path, the upload is zero during the forward pass (paid once at startup). For a prompt that generates 8 tokens — requiring 8 forward passes — how much total PCIe weight traffic does each path incur, and why does this gap make multi-token generation impractical on the streaming path?
+In the 32-layer loop, what changes each iteration, and what stays the same?
 
 **answer**
 
-**Streaming path:** ~14.4 GB per forward pass x 8 passes = **~115 GB** of PCIe transfers just for weights. At PCIe Gen4 x16 bandwidth (~25 GB/s), that's ~4.6 seconds of pure transfer time — plus the disk-to-CPU loading before each upload. Each token takes seconds.
+The weights change. Each layer has its own RMSNorm, attention, and FFN weights,
+and the loop must use the correct layer's tensors.
 
-**Resident BF16 path:** ~16 GB uploaded once at startup, then **zero** weight traffic for all 8 forward passes. The weights are already in VRAM. Per-token latency is bounded by GPU compute, not PCIe.
-
-The gap: streaming re-transfers the entire model for every token generated. The cost is linear in both layers (32) and tokens (T). For T=1 it's tolerable — you pay once and get one answer. For T=8 you pay 8x. For T=32 it's completely impractical. That's exactly why the multi-token path exists: pay the one-time BF16 upload cost (~165s cold on L4) and amortize it across all subsequent decode steps.
-
----
+The code path and scratch buffers stay the same. `X` is the running hidden state:
+the output of one layer becomes the input to the next layer.

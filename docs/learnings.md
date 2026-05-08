@@ -181,3 +181,76 @@ the next image to drift. Especially check: title text appears in visible content
 mask inequalities are explicit about row/column axes, output-layer panels cannot
 merge into decoder-block panels, and optional multi-token generation is described
 as a loop of one-token decode steps unless the code supports `q_seq > 1` decode.
+
+### Teaching docs need inline demo anchors, not code-reference indexes
+**Date:** 2026-05-07
+**Context:** Revising `docs/learn/*.md` for TA code-review prep
+
+When rewriting student-facing teaching docs, place code references only at the
+moments where a TA would naturally ask to see the implementation. Do not move
+all references into a top section unless the user explicitly asks for a code
+index. Even if the requested structure mentions "Code references for
+review/demo," keep references strategically tied to the teaching flow when the
+goal is a walkthrough doc.
+
+### Teaching docs must preserve TA-style questions
+**Date:** 2026-05-07
+**Context:** Revising `docs/learn/*.md` for TA code-review prep
+
+The TA-style question and answer are part of the teaching artifact, not optional
+extra material. When simplifying a `docs/learn/*.md` file, preserve the existing
+question/answer if it is accurate, or replace it with a better source-backed
+question that matches likely TA review prompts. Do not remove it during cleanup.
+
+### Teaching docs should be readable out loud
+**Date:** 2026-05-07
+**Context:** Revising `docs/learn/*.md` for spoken review prep
+
+The user reads the step docs out loud. Do not write meta-instructions like
+"show the TA here" or "this is the demo anchor" into the doc body. Phrase code
+references as normal implementation facts in the lesson, and use neutral
+section labels such as "Review question" when the text is meant to be spoken.
+
+### Teaching docs should be cue cards, not mini chapters
+**Date:** 2026-05-07
+**Context:** Revising `docs/learn/*.md` for simple spoken prep
+
+When the user asks for "super simple terms," keep the step short and direct.
+Do not turn source-backed correctness into a long explanation. Use the minimum
+number of paragraphs needed to explain the one main idea, one small example, one
+short review question, and one short answer.
+
+### Prompts for teaching docs must not ask for meta walkthrough text
+**Date:** 2026-05-07
+**Context:** Writing prompts for `docs/learn/*.md` rewrites
+
+Do not write prompts that say the final doc should explain where to "point" or
+what to "show the TA." That language leaks into the document. The prompt should
+say the doc is a read-aloud student script, cap the length, and require code
+references to appear only as quiet source citations inside normal teaching
+sentences.
+
+### Teaching docs should have one review answer
+**Date:** 2026-05-08
+**Context:** Revising `docs/learn/*.md` review question sections
+
+Do not put a separate "Review answer" after a "Review question" that already
+has an answer. It reads like two competing answers. Use one review section:
+"Review question" followed by "answer," and make that answer double as the
+student's spoken response.
+
+### Do not make review answers too thin
+**Date:** 2026-05-08
+**Context:** Revising `docs/learn/*.md` review question sections
+
+When collapsing duplicate review-answer sections, do not replace useful teaching
+content with a shallow one-line answer. Keep one review question, but make its
+answer complete enough to serve as the student's spoken summary of the step.
+
+### Use plain physical words in first-sentence summaries
+**Date:** 2026-05-08
+**Context:** Revising `docs/learn/*.md` read-aloud openings
+
+For "super simple terms," avoid abstract phrases like "steady size" or
+"stable representation" in the opening sentence. Use plain physical language:
+"numbers are not too big or too small," "copy the row," "save the result."

@@ -1,65 +1,56 @@
----
-
 ## Step 18: B>1 Batched Generation (Bonus Feature)
 
-**File:** `src/inference_loop.cu:116-234`
-**Where in the pipeline:** This is path 3 from step 1 — multiple prompts processed simultaneously in a single forward pass.
+Batching is useful because one-token decode can be too small to keep the GPU
+busy. Instead of running separate forward passes for several prompts, this path
+stacks the prompts into one taller batch and advances them together.
 
-### High-level picture
+### Main idea
 
-Instead of running two prompts through two separate forward passes, batched generation stacks them into one wider pass. Where B=1 processes `[s, 4096]` activations, B=2 processes `[2*s, 4096]`. The GPU does the same matmuls but on a taller matrix — and since the GPU is designed to saturate on large matrices, you get nearly 2x throughput for free.
+At B=1 decode, the model usually processes one new token:
 
-### How it works
-
-The orchestrator at line 116 follows the same prefill → decode loop as the B=1 path, with three key differences:
-
-**1. All prompts must be the same token length** (line 140-141). `validate_equal_lengths` enforces this up front. Mixed-length batching would require padding and masking inside the forward pass — out of scope for this project. The CLI in `main.cpp:169-183` pre-checks this before reaching the inference code.
-
-**2. KV cache is sized for the batch** (line 152). `KVCache cache(S_MAX, batch)` allocates B separate K/V regions per layer. Each batch slot has its own `[max_len, 1024]` buffer. This is why K/V projections in step 9 run per-batch-slot — each slot writes to its own cache region.
-
-**3. Finished slots keep feeding EOT** (lines 194-201). When one prompt finishes (emits EOT) before others, it keeps advancing through the forward pass with EOT tokens. The dimensions stay constant so the batch shape and KV cache layout don't need resharding. The generated tokens for finished slots are simply ignored. This wastes a small amount of compute but avoids the complexity of dynamic batching.
-
-### The decode loop
-
-Lines 186-226 — same structure as single-prompt decode:
-
-```
-for step in 1..max_new_tokens:
-    if all slots done: break
-    embed B tokens (one per slot)              ← get_embeddings_batched
-    forward_step(q_seq=1, batch=B)             ← one forward pass for all B slots
-    for each active slot:
-        lm_head → argmax → check EOT
+```text
+rows = 1 * q_seq
 ```
 
-Each `forward_step` call processes all B prompts in lockstep. The matmul kernels see `rows = B * q_seq` — for decode that's `B * 1 = B` rows. The matmul tiles fill more completely with B>1, improving GPU utilization.
+That gives the matmul kernels very few rows of work. With batching, `forward_step`
+sets `rows = batch * q_seq` at `src/inference_layer.cu:187`, so the same kernels
+process more rows in one call.
 
-### Why batching helps performance
+The batched path starts in `generate_tokens_resident_batched_impl` at
+`src/inference_loop.cu:116`. It does one prefill for all prompts, then one decode
+loop where each batch slot produces one token per step.
 
-A single-token decode (B=1, q_seq=1) produces tiny matmuls: `[1, 4096] × [4096, 4096]`. The GPU has thousands of cores but only 4,096 multiply-adds to do — most cores sit idle. With B=4, the matmul is `[4, 4096] × [4096, 4096]` — 4x more work, but the GPU was already underutilized, so it finishes in nearly the same wall time. That's the throughput win: same latency, more prompts answered.
+This does not change the model math for each prompt. Each prompt still has its
+own generated token IDs and its own K/V cache region. The goal is to share the
+same forward-pass schedule and keep the GPU busier.
 
-### Limitations
+### Where it fits
 
-- Equal-length prompts only (no padding/masking)
-- All slots advance together — fast prompts (short answers) waste compute waiting for slow ones
-- KV cache scales linearly with B (step 17's scaling table applies)
+This is an optional bonus path. The base project can assume one prompt at a
+time.
 
-### TA-scrutiny items
+The simple constraint is that all prompts must tokenize to the same length.
+The code checks that at `src/inference_loop.cu:141`. Equal lengths keep the
+batched tensors rectangular and let every slot share the same `q_seq`.
 
-This is a bonus feature (up to 5% extra credit). The key thing to articulate is *why* batching improves throughput: GPU underutilization at B=1 decode. The matmul hardware is designed for large matrices; batching gives it more rows to fill.
+Mixed lengths would need padding plus attention masks so short prompts do not
+attend to fake pad tokens. This implementation does not do that.
 
----
+Finished slots also stay in the batch until the whole batch is done. If one slot
+emits `EOT_ID` early, the decode loop feeds `EOT_ID` for that slot at
+`src/inference_loop.cu:200`. That keeps the batch shape and cache layout fixed.
 
-**TA-style question (final one):**
+### Review question
 
-The batched path requires equal-length prompts. If you wanted to support variable-length prompts in the same batch, what two problems would you need to solve in the forward pass, and which one is harder?
+Why does this batching path require equal tokenized prompt lengths, and why do
+finished slots keep feeding `EOT_ID`?
 
 **answer**
 
-**Problem 1: Padding + masking.** Shorter prompts need to be padded to the longest prompt's length so the matrices are rectangular. But padding tokens shouldn't contribute to attention scores or RMSNorm statistics. You'd need a per-slot length mask that zeros out padding in the causal mask, excludes padding from the RMSNorm sum-of-squares, and ensures the "last token" extract (step 15) picks the right row per slot — not the padded row.
+Equal lengths let all prompts share the same rectangular batch shape and the
+same `q_seq`. Without that, the code would need padding and pad-aware attention
+masks.
 
-**Problem 2: Per-slot attention windows.** In the causal mask, each slot's valid positions are different. Slot 0 (10 tokens) should attend to positions 0-9; slot 1 (15 tokens) should attend to 0-14. The causal mask becomes a per-slot mask rather than a single shared `col > row` check. The KV cache also has different valid ranges per slot — attention for slot 0 must not read slot 1's cached K/V values (which live at different positions in the buffer).
-
-**The harder one is attention masking.** Padding the embeddings and skipping padding in RMSNorm/residual is mechanical — a few `if` checks. But fixing the attention mask requires changing the mask kernel to be batch-aware, and more importantly, the KV cache read window must be per-slot. Every kernel that touches the score matrix or reads from the cache needs to know each slot's true length. This is why production systems (vLLM, TensorRT-LLM) treat variable-length batching as a first-class design problem rather than a bolt-on.
-
----
+Finished slots keep feeding `EOT_ID` so the batch size does not change while
+generation is running. That avoids reshaping tensors or moving cache regions
+mid-loop.

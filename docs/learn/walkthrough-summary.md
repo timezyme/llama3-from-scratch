@@ -1,41 +1,39 @@
----
-
-## Walkthrough Summary: TA-Scrutiny Cheat Sheet
+## Walkthrough Summary: Review Cheat Sheet
 
 ### The pipeline in one sentence
 
-Prompt -> chat template -> BPE encode -> embed [s, 4096] -> 32 decoder layers -> final RMSNorm -> last-token extract -> lm_head [128256] -> argmax -> text.
+Prompt -> chat-template token IDs (special tokens + BPE prompt) -> embed [s, 4096] -> 32 decoder layers -> final RMSNorm -> last-token extract -> lm_head [128256] -> argmax -> text.
 
 ### M1 Mandatory (matmul kernel)
 
 | Optimization            | What it does                                   | Where               |
 | ----------------------- | ---------------------------------------------- | ------------------- |
-| **Tiling**              | 128x128 output tiles, 16-wide K slabs          | `matmul.cu:72-74`   |
-| **Shared-memory reuse** | Load from HBM once, reuse 128x from smA/smB    | `matmul.cu:165-166` |
-| **Coalesced access**    | Consecutive threads read consecutive addresses | `matmul.cu:194-227` |
-| Double-buffering        | Overlap load + compute via ping-pong buffers   | `matmul.cu:244-322` |
+| **Tiling**              | 128x128 output tiles, 16-wide K slabs          | `kernel/matmul.cu:72-74`   |
+| **Shared-memory reuse** | Load from HBM once, reuse 128x from smA/smB    | `kernel/matmul.cu:165-166` |
+| **Coalesced access**    | Consecutive threads read consecutive addresses | `kernel/matmul.cu:194-227` |
+| Double-buffering        | Overlap load + compute via ping-pong buffers   | `kernel/matmul.cu:244-322` |
 
-### Part 2 Pitfalls (expect TA questions on all of these)
+### Part 2 Pitfalls (expect review questions on these)
 
 | Pitfall                      | Correct behavior                                    | Where                        |
 | ---------------------------- | --------------------------------------------------- | ---------------------------- |
-| **Stable softmax**           | Subtract row max before exp() — otherwise NaN       | `attention.cu:155-207`       |
-| **RoPE pairing**             | (i, i+h_d/2) NOT (2i, 2i+1)                         | `rope.cu:123-124`            |
-| **RoPE base**                | 500,000 NOT 10,000                                  | `rope.cu:186`                |
-| **Two RMSNorm gammas/layer** | input_layernorm + post_attention_layernorm          | `model_weights.cpp:124-129`  |
-| **Gamma not skipped**        | y = (x/rms) * gamma — the multiply is required      | `rmsnorm.cu:145`             |
-| **Transposed weights**       | Loaded as [in, out] — matmul does X @ W_stored      | `model_weights.cpp:232-239`  |
-| **Full causal mask**         | Every (p, q) with q > p, not just diagonal/last row | `attention.cu:130-138`       |
-| **Last-token-only lm_head**  | Project only row s-1, not all s rows                | `inference_layer.cu:450-460` |
-| **lm_head != embed_tokens**  | tie_word_embeddings=false in Instruct checkpoint    | `model_weights.cpp:36-40`    |
+| **Stable softmax**           | Subtract row max before exp(), or exp can overflow  | `kernel/attention.cu:155-207` |
+| **RoPE pairing**             | (i, i+h_d/2) NOT (2i, 2i+1)                         | `kernel/rope.cu:125-126`     |
+| **RoPE base**                | 500,000 NOT 10,000                                  | `config.h:26`                |
+| **Two RMSNorm gammas/layer** | input_layernorm + post_attention_layernorm          | `src/model_weights.cpp:124-129` |
+| **Gamma not skipped**        | y = (x/rms) * gamma; the multiply is required       | `kernel/rmsnorm.cu:145`      |
+| **Transposed weights**       | Transpose to [in, out], then matmul does X @ W      | `src/model_weights.cpp:227-239` |
+| **Full causal mask**         | Prefill masks every (p, q) with q > p               | `kernel/attention.cu:130-138` |
+| **Last-token-only lm_head**  | Project only row s-1, not all s rows                | `src/inference_layer.cu:450-460` |
+| **lm_head != embed_tokens**  | tie_word_embeddings=false in this checkpoint        | `src/model_weights.cpp:35-40` |
 
 ### Bonus features shipped
 
-| Feature                   | Key insight for TA                                              | Where                       |
+| Feature                   | Key idea                                                        | Where                       |
 | ------------------------- | --------------------------------------------------------------- | --------------------------- |
-| **KV cache**              | O(T) decode instead of O(T^2). Only new K gets RoPE.            | `kv_cache.h/cu`             |
-| **B>1 batching**          | Same latency, more throughput — GPU underutilized at B=1 decode | `inference_loop.cu:116-234` |
-| **Resident BF16 weights** | 16 GB fits L4 VRAM; eliminates per-step PCIe transfers          | `device_weights.cu`         |
+| **KV cache**              | Decode writes new K/V rows; old cached rows stay reusable       | `src/inference_layer.cu:334-378` |
+| **B>1 batching**          | More throughput by advancing prompts in lockstep                | `src/inference_loop.cu:116-234` |
+| **Resident BF16 weights** | 16 GB fits L4 VRAM; avoids per-step layer uploads               | `src/device_weights.cu:148-150` |
 
 ### Key numbers to know
 

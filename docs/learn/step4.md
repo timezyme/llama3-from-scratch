@@ -1,74 +1,62 @@
----
-
 ## Step 4: Dump Format & Loader
 
-**Files:** `tools/dumper.py`, `src/loader.cpp`, `include/milifloat.h`
-**Where in the pipeline:** This is the bridge between the Python model files (HuggingFace `.safetensors`) and the C++ inference engine. It runs once offline — not during inference.
+The model weights live in HuggingFace `.safetensors` files. Plain C++ cannot read that format.
 
-### High-level picture
+So we build a tiny bridge:
 
-The model weights ship from HuggingFace in `.safetensors` format, which is a Python ecosystem format. Your C++ code can't read that directly. So there's a two-step process:
+1. A Python script writes each tensor as one binary file. That happens in `write_tensor_file()` at `tools/dumper.py:159-186`.
+2. The C++ loader reads those binary files at startup. That happens in `load_dense_tensor_checked()` at `src/loader.cpp:217-234`.
 
-1. **Python dumper** (`tools/dumper.py`) reads the safetensors, converts each tensor to BF16, and writes a simple binary file per tensor.
-2. **C++ loader** (`src/loader.cpp`) reads those binary files at inference time.
+This bridge runs **once, offline**. It is not part of inference.
 
-Each binary file has a dead-simple format:
+### The main idea
 
-```
-[  280-byte header  ][  raw payload bytes  ]
+The important idea is:
 
-Header layout (little-endian):
-  Bytes 0-255:   tensor name (ASCII, null-padded)
-  Bytes 256-259: dtype code (0=FP32, 1=FP16, 2=BF16)
-  Bytes 260-263: ndims (1 or 2)
-  Bytes 264-271: shape[0] (uint64)
-  Bytes 272-279: shape[1] (uint64, 0 if 1D)
+```text
+a tiny binary format that both sides agree on
 ```
 
-The dumper organizes output into directories: `embeddings.bin` for the embedding table, `layer_00/` through `layer_31/` for per-layer weights, and `global/` for things like the final norm and lm_head.
+Each binary file looks like this:
 
-### Two loading paths in C++
+```text
+[ 280-byte header ][ raw number bytes ]
+```
 
-The loader has two modes depending on which inference path called it:
+The header carries four things:
 
-| Mode           | Function                                  | What it does                             | Used by                         |
-| -------------- | ----------------------------------------- | ---------------------------------------- | ------------------------------- |
-| **FP32 widen** | `load_dense_tensor_checked` (line 217)    | Decodes every element to FP32            | Path 1 (single-token streaming) |
-| **Raw BF16**   | `load_bf16_raw_tensor_checked` (line 240) | memcpy the payload as-is — no conversion | Paths 2-4 (GPU-resident)        |
+- the tensor name (ASCII, padded to 256 bytes)
+- the number type (FP32, FP16, or BF16)
+- how many dimensions
+- the size of each dimension
 
-The FP32 path calls `decode_value()` (line 192) on every element, which dispatches based on dtype code to either a straight memcpy (FP32), `half_to_float()` (FP16), or `bf16_to_float()` (BF16).
+Python writes that header layout in `tools/dumper.py:32-33`. C++ defines the matching constants in `src/loader.cpp:29-43` and reads the bytes back in `parse_header()` at `src/loader.cpp:142-163`.
 
-### New concept: BF16 vs FP16
+Because both sides agree on those 280 bytes, we do not need to link any ML library at runtime.
 
-Both are 16-bit floats, but they carve up the bits differently:
+### Small example
 
-| Format   | Exponent bits | Mantissa bits | Range        | Precision |
-| -------- | ------------- | ------------- | ------------ | --------- |
-| FP32     | 8             | 23            | huge         | high      |
-| **BF16** | **8**         | **7**         | same as FP32 | low       |
-| FP16     | 5             | 10            | small        | medium    |
+The K projection weight for layer 0 looks like this on disk:
 
-BF16 keeps FP32's full exponent (same range of representable numbers) but cuts precision to 7 mantissa bits. This is why `bf16_to_float()` in `milifloat.h:18` is a single left-shift by 16 — the BF16 bits are literally the top 16 bits of an FP32 value. FP16 has a different exponent width, so `half_to_float()` (line 28) has to rebias the exponent from 5-bit (bias 15) to 8-bit (bias 127), handle subnormals, infinities, and NaNs — much more code.
+```text
+header:   name  = "model.layers.0.self_attn.k_proj.weight"
+          dtype = BF16
+          shape = [1024, 4096]
+payload:  1024 * 4096 * 2 bytes of raw BF16
+```
 
-### Embedding table: lazy per-row decode
+The C++ loader parses the header, checks the shape matches what the model expects, and decodes the payload to FP32.
 
-The embedding table is 128,256 rows x 4,096 columns. Instead of decoding all ~525 million values to FP32 up front, `load_embeddings()` (line 300) caches the raw blob and `get_embeddings()` (line 348) decodes only the rows you need — one per token in the prompt. For a 10-token prompt, that's 10 rows decoded instead of 128,256.
+BF16 is short for bfloat16, a 16-bit float that shares FP32's 8-bit exponent. That makes `bf16_to_float()` in `include/milifloat.h:18-23` just a 16-bit left shift — the BF16 bits become the top half of a 32-bit float.
 
-### TA-scrutiny items
+### Where this fits
 
-- **BF16/FP16/FP32 decode**: Know the difference and why BF16 conversion is a one-liner while FP16 is not.
-- **Header validation**: The loader strictly validates shape, dtype, and file size (lines 114-136). This is a deliberate design choice — silent header drift produces "model runs but outputs garbage."
+This step is offline prep. It writes the binary files once.
 
----
+Step 5 is where those files actually get loaded into `ModelWeights` and reshaped for the matmul kernels.
 
-**TA-style question:**
+### TA answer
 
-The lazy embedding approach decodes only the rows you need. But there's a second, subtler reason for not decoding the full table up-front. The full table is 128,256 x 4,096. In FP32, how many bytes is that? And what does that number mean on a machine with limited RAM when you also have 32 layers of weights to load?
+If a TA asks how the weights get from HuggingFace into the C++ engine, say:
 
-**answer**
-
-128,256 x 4,096 x 4 bytes = \~2 GB in FP32. The raw BF16 blob is half that (\~1 GB). If you eagerly decoded the whole table to FP32, you'd hold *both* the 1 GB raw blob (while reading it) and the 2 GB FP32 output simultaneously — 3 GB just for embeddings. Meanwhile you also need to load 32 layers of weights. On a memory-constrained machine, that peak allocation matters.
-
-By keeping the raw blob and decoding per-row, you only ever allocate `s x 4096 x 4` bytes of FP32 output (a few hundred KB for a typical prompt), and the 1 GB raw blob serves as both storage and source. You never pay the 2 GB FP32 expansion of the full table.
-
----
+> A Python script writes each tensor as a binary file: a 280-byte header (name, dtype, shape) followed by raw payload bytes. The C++ loader parses the header, validates the shape, and decodes the payload to FP32. The format is dead simple on purpose — it is the only contract the two sides share, so we do not need to link any ML library at runtime.
