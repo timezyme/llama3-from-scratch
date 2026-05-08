@@ -4,6 +4,15 @@
 
 Prompt -> chat-template token IDs (special tokens + BPE prompt) -> embed [s, 4096] -> 32 decoder layers -> final RMSNorm -> last-token extract -> lm_head [128256] -> argmax -> text.
 
+### Glossary (terms used above)
+
+| Term            | Plain meaning                                                  | Where                            |
+| --------------- | -------------------------------------------------------------- | -------------------------------- |
+| **one-hot**     | Vector of zeros with a single `1` at one position; the `1`'s index = the token ID. Embedding math is `one-hot × table`, but code skips the multiply (mostly zeros) | `src/loader.cpp:348-381` (direct row copy) |
+| **logit**       | Raw score for one vocab word; bigger = more likely (not a probability yet) | output of `lm_head`              |
+| **`lm_head`**   | Final matrix that scores all 128,256 vocab words; does not pick one | `src/inference_layer.cu:450-460` |
+| **`argmax`**    | Picks the index of the biggest logit; that index is the next token  | `src/inference_layer.cu:450-460` |
+
 ### M1 Mandatory (matmul kernel)
 
 | Optimization            | What it does                                   | Where               |

@@ -1,4 +1,4 @@
-<!-- Generated: 2026-05-02 | Updated: 2026-05-05 | Files scanned: 5 (loader, model_weights, dumper, gen_token_model, kv_cache) | Token estimate: ~550 -->
+<!-- Generated: 2026-05-02 | Updated: 2026-05-08 | Files scanned: 6 (loader, model_weights, device_weights, dumper, gen_token_model, kv_cache) | Token estimate: ~550 -->
 
 # Data Format
 

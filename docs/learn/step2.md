@@ -48,3 +48,4 @@ If you closed the assistant turn with EOT, the model would see a complete conver
 The open assistant turn is what makes the model "fill in the blank." Close it and there's no blank to fill.
 
 ---
+

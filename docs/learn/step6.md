@@ -57,6 +57,10 @@ Just row lookup.
 
 ### This is not a matmul
 
+A **one-hot vector** is a vector that is all zeros except for a single `1` at one position — the position tells you "which item." For the embedding case, the vector has length 128,256 (the vocab size), with the `1` at the position of the token ID.
+
+Tiny example: pretend the vocab is just 5 words `[cat, dog, fish, bird, ant]`. Token ID 2 = "fish". The one-hot for "fish" is `[0, 0, 1, 0, 0]`.
+
 Mathematically, embedding lookup can be described as a one-hot vector times the embedding table.
 
 But the code does not do that.
@@ -72,3 +76,4 @@ That is the whole trick.
 If a TA asks what embedding lookup does, say:
 
 > It turns token IDs into vectors. Each token ID selects one row from the embedding table, so a sequence of `s` token IDs becomes an `[s, 4096]` matrix. That matrix is the input to the first decoder layer.
+

@@ -52,6 +52,22 @@ Now a row with 4,096 numbers can multiply into a K vector with 1,024 numbers.
 [rows, 4096] x [4096, 1024] = [rows, 1024]
 ```
 
+### The FFN projections (`gate`, `up`, `down`)
+
+The K projection above is one example. Every decoder layer also has three
+**FFN** (feed-forward network) weights that get the same transpose-at-load
+treatment — these are the `gate`, `up`, `down` boxes shown in `step5.png`
+alongside Q/K/V/O:
+
+- **`up`** and **`gate`**: each widens 4,096 -> 14,336. Stored on disk as
+  `[14336, 4096]`, transposed to `[4096, 14336]` at load.
+- **`down`**: narrows 14,336 -> 4,096. Stored as `[4096, 14336]`, transposed
+  to `[14336, 4096]`.
+
+The loader does not care what they're for. It just runs the same
+`[out, in] -> [in, out]` flip on every 2D weight. Step 7 covers what
+`gate`, `up`, `down` actually compute (SwiGLU FFN).
+
 ### Where it fits
 
 Global weights are loaded separately at `src/model_weights.cpp:41`. That includes

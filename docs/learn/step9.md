@@ -16,9 +16,13 @@ V = X_norm x W_V  -> [rows, 1024]
 Step 5 already transposed the checkpoint weights, so here `W_Q`, `W_K`, and
 `W_V` mean the stored `[in, out]` matrices.
 
-A query, or Q, is what a token is looking for. A key, or K, is what another
-token can match against. A value, or V, is the information attention will mix
-into the output.
+A query, or Q, is what a token is looking for.
+
+A key, or K, is what each token offers up so others can match against it.
+
+A value, or V, is the content that gets blended into the output.
+
+Q and K decide *how much* to mix in; V is *what* gets mixed.
 
 The key detail is the shape difference. The constants start at `config.h:17`:
 32 query heads, 8 key/value heads, and 128 numbers per head. So Q is

@@ -154,7 +154,7 @@ The model creates three views of the same data:
 
 Llama 3 uses grouped-query attention. There are 32 query heads but only 8 key/value heads. Four query heads share one key/value head. This saves memory and work.
 
-The code currently reshapes each head on the host side, then launches GPU matmuls and helper kernels for each head. It is correct and tested. It is not the fastest possible design because some data moves between CPU and GPU during attention. That is tracked as TODO item 8.
+The code launches the per-head matmuls and helper kernels with device pointers — Q, K, V, and the per-head scratch buffers all live in GPU memory across the head loop. The host loop only iterates head indices and dispatches kernels; no per-head tensor data is copied back to the CPU during attention.
 
 ## How The Output Token Is Chosen
 

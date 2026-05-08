@@ -1,4 +1,4 @@
-<!-- Generated: 2026-05-02 | Updated: 2026-05-05 | Files scanned: 7 kernel files | Token estimate: ~600 -->
+<!-- Generated: 2026-05-02 | Updated: 2026-05-08 | Files scanned: 8 kernel files | Token estimate: ~600 -->
 
 # CUDA Kernels
 

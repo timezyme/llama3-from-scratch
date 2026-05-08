@@ -1,6 +1,6 @@
 # Source Tree Analysis
 
-**Generated:** 2026-03-29 | **Scan Level:** Exhaustive
+**Generated:** 2026-03-29 | **Updated:** 2026-05-08 | **Scan Level:** Exhaustive
 
 ## Annotated Directory Tree
 
@@ -86,19 +86,20 @@ CS265-llm-starter-main/
 │   └── run_tests.sh              # Local test runner
 │
 ├── docs/                         # Documentation and reports
+│   ├── index.md                  # Documentation index
 │   ├── JOURNAL.md                # Development journal
 │   ├── learnings.md              # Project-specific knowledge and gotchas
-│   ├── llm_part1.md / .pdf       # Course assignment Part 1
-│   ├── llm_part2.md / .pdf       # Course assignment Part 2
-│   ├── mid-checkin.md / .pdf     # Mid-project check-in
-│   ├── Milestone1-Report.md/.pdf # Milestone 1 completion report
-│   ├── plans/
-│   │   ├── milestone1_spec.md    # Milestone 1 specification
-│   │   ├── milestone2-3-plan.md  # M2-3 implementation plan
-│   │   └── milestone2-3-remaining.md # M2-3 remaining work tracker
-│   └── presentation/
-│       ├── index.html            # Interactive guided tour (14 steps)
-│       └── step-01..14.png       # Annotated screenshots
+│   ├── walkthrough-progress.md   # Code-review walkthrough progress tracker
+│   ├── RUNBOOK-L4.md             # GCP L4 provisioning + test + demo runbook
+│   ├── CODEMAPS/                 # Token-lean architecture refs (architecture/kernels/data/dependencies)
+│   ├── generated/                # This file lives here; auto-regenerated docs
+│   ├── assignment/               # Course assignment specs (llm_part1/2 .md + .pdf)
+│   ├── reports/                  # mid-checkin.md, Milestone1-Report.md, code-review-prep.md, handoff-prompt.md
+│   ├── plans/                    # Implementation plans (inference-cu-split, todo2-batching, submission-wrap-up, ...)
+│   ├── learn/                    # Read-aloud cue cards step1..step18 + walkthrough-summary
+│   ├── tests/                    # Per-test deep-dive notes
+│   ├── diagrams/                 # Mermaid sources + rendered PNGs (pipeline, residuals, key areas)
+│   └── notes/                    # Working notes
 │
 ├── assets/                       # [GITIGNORED] Model weights and tokenizer
 │   └── llama3/

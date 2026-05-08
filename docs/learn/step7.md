@@ -11,6 +11,32 @@ up, down, and the attention matmuls.
 
 The kernel does not know what Q or K means. It only knows matrix shapes.
 
+### What `gate`, `up`, and `down` mean
+
+That list splits cleanly. Q, K, V, O are the **attention** matmuls (covered in
+later steps). `gate`, `up`, `down` are the **FFN** (feed-forward network)
+matmuls — the per-layer MLP block that runs right after attention:
+
+- **`up`**: widens the 4,096-dim vector up to 14,336 dim. Shape `[4096, 14336]`.
+- **`gate`**: also widens 4,096 -> 14,336, but its output is fed through SiLU
+  and used as a gating signal that multiplies element-wise into `up`. Same
+  shape as `up`.
+- **`down`**: narrows the 14,336-dim result back down to 4,096 dim. Shape
+  `[14336, 4096]`.
+
+Order in code:
+
+```text
+gate_out = X @ W_gate          # [s, 14336]
+up_out   = X @ W_up            # [s, 14336]
+hidden   = SiLU(gate_out) * up_out
+ffn_out  = hidden @ W_down     # [s, 4096]
+```
+
+`SiLU(gate) * up` is the **SwiGLU** activation. The names are literal: `up`
+widens, `down` narrows, and `gate` decides how much of `up` actually gets
+through.
+
 ### Main idea
 
 The main idea is **reuse**.
@@ -59,6 +85,16 @@ The BF16-weight version starts at `kernel/matmul.cu:358` in
 
 It stores weights as BF16 to save memory, widens them to FP32 inside the
 kernel, and still accumulates in FP32.
+
+"Accumulates in FP32" means the running total is kept in FP32 even though the
+inputs are BF16.
+
+Why it matters: BF16 has less precision than FP32, so if you also stored the
+running total as BF16, the small rounding errors from each of the 4,096 adds
+would compound and your output would drift.
+
+FP32 accumulation keeps the running tally exact, so only the inputs lose a bit
+of precision — not the sum.
 
 ### The exception
 

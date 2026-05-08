@@ -1,12 +1,12 @@
 # Project Overview — CS265 LLM Inference Engine
 
-**Generated:** 2026-03-29 | **Scan Level:** Exhaustive
+**Generated:** 2026-03-29 | **Updated:** 2026-05-08 | **Scan Level:** Exhaustive
 
 ## Executive Summary
 
 A from-scratch C++17 implementation of Llama 3 8B inference, built as a Harvard CS265 course project. The system implements the complete inference pipeline — BPE tokenization, binary weight loading with BF16/FP16/FP32 conversion, and GPU-accelerated matrix multiplication via custom CUDA kernels — without relying on ML framework dependencies at runtime.
 
-**Milestones 1-3 are complete:** all 7 M1 tests and 30 M2-3 tests pass on a GCP L4 GPU instance (sm_89). CLI inference produces correct tokens validated against PyTorch. Bonus credit landed: TODO #1 (KV cache + resident BF16 weights) and TODO #2 (B>1 batching).
+**Milestones 1-3 are complete:** all 7 M1 tests and 38 M2-3 tests pass on a GCP L4 GPU instance (sm_89). CLI inference produces correct tokens validated against PyTorch. Bonus credit landed: TODO #1 (KV cache + resident BF16 weights) and TODO #2 (B>1 batching).
 
 ## Quick Reference
 
@@ -19,7 +19,7 @@ A from-scratch C++17 implementation of Llama 3 8B inference, built as a Harvard 
 | **Architecture** | Pipeline-based inference engine |
 | **Repository Type** | Monolith |
 | **Entry Point** | `main.cpp` |
-| **Test Binaries** | `bin/tests` (7 M1 tests), `bin/tests_m2m3` (30 M2-3 tests) |
+| **Test Binaries** | `bin/tests` (7 M1 tests), `bin/tests_m2m3` (38 M2-3 tests) |
 
 ## Technology Stack
 
@@ -71,7 +71,7 @@ BPE Tokenizer (decode) -> Output Text
 ## Current Status
 
 - **Milestone 1**: Complete — BPE tokenizer, binary weight loader, CUDA tiled GEMM matmul, all 7 tests passing
-- **Milestones 2-3**: Complete — full 32-layer forward pass, CUDA kernels (RMSNorm, RoPE, GQA attention, SwiGLU, residual, BF16-weight matmul), model weight management with transpose-at-load + resident BF16 path, CLI inference with Llama 3 Instruct chat template, all 30 M2-3 tests passing
+- **Milestones 2-3**: Complete — full 32-layer forward pass, CUDA kernels (RMSNorm, RoPE, GQA attention, SwiGLU, residual, BF16-weight matmul), model weight management with transpose-at-load + resident BF16 path, CLI inference with Llama 3 Instruct chat template, all 38 M2-3 tests passing
 - **Bonus credit shipped**: TODO #1 (KV cache + resident BF16 weights, +5%) and TODO #2 (B>1 batching, +5%); both ship with internal parity tests
 
 ## Links
