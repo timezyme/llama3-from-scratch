@@ -1,0 +1,175 @@
+Title
+Key Area 3: RoPE - Position Rotation on Q and K
+
+Knowledge-transfer goal
+Create a high-resolution 16:9 educational infographic for a CS265 TA-prep
+explanation of RoPE in this Llama 3 inference repo. The viewer should grasp
+the main idea in 10 seconds: RoPE does not add a position vector; it rotates
+Q and K values in place so attention scores carry position. After 60 seconds,
+the viewer should be able to explain which tensors are changed, where the code
+does it, and the two Llama 3 gotchas: base 500000 and rotate-half pairing.
+
+Core story
+RoPE is a position-dependent rotation applied inside every decoder layer after
+Q/K/V projection and before attention. It rotates Q for the current rows and
+only the newly written K rows in the KV cache; V is cached and read by attention
+but is never rotated. The cos/sin table is built once, then `forward_step`
+slices it by `len_before` so prefill starts at position 0 and decode starts at
+the next uncached absolute position.
+
+Hard readability rules
+- Render the title, one top bridge, and exactly 4 main panels. If space is
+  tight, shorten labels; do not merge panels.
+- Cap all visible text around 120-180 words total, including title, labels,
+  TA answer, trap strip, and source strip.
+- Use large type, short labels, arrows, tensor blocks, and one compact formula.
+  No paragraphs in the image.
+- If the layout feels crowded, delete secondary detail before shrinking text.
+  Delete in this order: extra shape labels, function names, source anchors,
+  constants, then optional formula terms. Never shrink text below readability.
+- Use only one small code-like line for position: `table row = len_before + (row % q_seq)`.
+- Keep guardrail facts accurate, but do not render them unless they are listed
+  in "Visible content to render", "Small TA answer box", "Small trap strip",
+  or "Bottom source strip".
+
+Visual style
+- Polished white-background technical study poster, vector-like and crisp,
+  suitable for 2400 x 1350 or larger.
+- Purple for RoPE rotation, blue for Q/K tensors, gray for V/cache, green for
+  GPU/table flow, red only for misconception warnings.
+- Prefer diagrams over prose: tensor blocks, half-vector brackets, curved
+  rotation marks, arrows, and simple contrast labels.
+- Do not use decorative clutter, dense checklists, tiny footnotes, or long code
+  blocks.
+
+Visible content to render
+Render this as the main visible infographic, keeping the wording close and
+short:
+
+Title and subtitle:
+   - `Key Area 3: RoPE - Position Rotation on Q and K`
+   - `RoPE rotates Q and K in place so attention scores carry position`
+
+1. Top bridge
+   - `RoPE rotates position into Q and K`
+   - `No extra vector. Same shape.`
+   - `Q/K rotation -> position-aware attention scores`
+
+2. Panel A: What changes?
+   - `Q [rows,4096]: rotate`
+   - `new K [q_seq,1024]: rotate`
+   - `V [q_seq,1024]: cache only`
+   - `attention reads cached K/V [kv_seq,1024]`
+
+3. Panel B: Rotate-half pair
+   - `HEAD_DIM=128: split 0..63 | 64..127`
+   - `(i, i+64): (0,64) ... (63,127)`
+   - `angle = pos * 1/500000^(2i/128)`
+
+4. Panel C: Position table
+   - `cos/sin [1024,64] built once`
+   - `slice starts at len_before`
+   - `table row = len_before + (row % q_seq)`
+   - `prefill starts 0; decode starts next`
+
+5. Panel D: Layer timing
+   - `each layer: QKV -> RoPE(Q,new K) -> attention`
+   - `old K already rotated`
+   - `cache.advance after 32 layers`
+
+Small TA answer box
+Render one compact answer script, not a full Q&A list:
+
+`TA script: RoPE rotates Q and new K in place so Q dot K carries position.
+Llama 3 uses base 500000 and rotate-half pairs like 0<->64. V stays
+unrotated; it carries content after attention chooses what to read.`
+
+Small trap strip
+Render as a thin red strip with short labels:
+
+`Do not say: base 10000 | even/odd pairs | rotate V | extra position tensor |
+old K re-rotates | decode position is always 0`
+
+Bottom source strip
+Render only these anchors, small but legible:
+
+`config.h` constants | `kernel/rope.cu` table + kernel |
+`src/inference_loop.cu` alloc table | `src/inference_layer.cu` RoPE calls |
+`src/inference_internal.h` S_MAX
+
+Guardrail facts the image must obey but should not render unless listed
+- RoPE applies to Q and K in-place before attention.
+- RoPE does not append coordinates, add a learned position embedding, add a
+  position column, or create a separate tensor in the visible activation path.
+- For token position `p` and pair index `i`,
+  `theta_i = 1 / 500000^(2i / h_d)` and `angle = p * theta_i`.
+- Llama 3 uses `ROPE_BASE = 500000`, not 10000.
+- Pairing is rotate-half: dimension `i` pairs with `i + h_d/2`, not even/odd
+  `(0,1), (2,3)`.
+- With `HEAD_DIM = 128`, `half_hd = 64`, so valid visual pairs are
+  `(0,64)`, `(1,65)`, ..., `(63,127)`.
+- The per-pair rotation is:
+  `x_new[i] = x[i] * cos(angle) - x[i+64] * sin(angle)`
+  `x_new[i+64] = x[i] * sin(angle) + x[i+64] * cos(angle)`
+- Rotation applies independently to Q heads and K heads.
+- Repo constants: `ROPE_BASE=500000`, `HEAD_DIM=128`, `half_hd=64`,
+  `NUM_HEADS=32`, `NUM_KV_HEADS=8`, `NUM_LAYERS=32`, `S_MAX=1024`.
+- Exact shape labels, if rendered, must be:
+  `Q [rows,4096]`, `K new [q_seq,1024]`, `V new [q_seq,1024]`,
+  `cached K [kv_seq,1024]`, `cached V [kv_seq,1024]`, `cos/sin [1024,64]`.
+- `rows = batch * q_seq`.
+- `kv_seq = len_before + q_seq`.
+- During prefill, `q_seq` is prompt length and `len_before = 0`.
+- During decode, `q_seq = 1` and the effective absolute position is
+  `len_before`, not always 0.
+- `kernel/rope.cu` contains `precompute_rope_table(...)`, `gpu_rope(...)`,
+  and `rope_kernel(...)`.
+- `src/inference_loop.cu` contains `alloc_rope_tables(...)`, which builds
+  `[S_MAX, HEAD_DIM/2] = [1024,64]` cos/sin tables and uploads them to VRAM.
+- `src/inference_layer.cu` contains `forward_step(...)`, computes
+  `d_cos_step = d_cos_full + len_before * half_hd` and
+  `d_sin_step = d_sin_full + len_before * half_hd` once before the 32-layer
+  loop, then reuses those sliced pointers inside every layer.
+- `rope_kernel` computes literal local position as `pos = row % q_seq`.
+  The effective absolute table row comes from the already-offset
+  `d_cos_step` / `d_sin_step` pointers.
+- `forward_step(...)` computes Q from `d_Xnorm`, computes K/V into the
+  `KVCache`, rotates `d_Q`, rotates `cache.k_at(layer, len_before, b)`, does
+  not rotate V, then attention reads rotated Q plus full cached K/V.
+- The exact Q call is:
+  `gpu_rope(d_Q, d_cos_step, d_sin_step, rows, NUM_HEADS, HEAD_DIM, q_seq)`.
+- The exact K call is:
+  `gpu_rope(cache.k_at(layer, len_before, b), d_cos_step, d_sin_step, q_seq, NUM_KV_HEADS, HEAD_DIM, q_seq)`.
+- Old cached K rows were rotated when first written. During decode, only the
+  new K row is rotated before attention reads the full cache.
+- V rows are cached and read by attention across `[0, kv_seq)`, but V rows are
+  never passed to `gpu_rope`.
+- `cache.advance(q_seq)` happens after all 32 decoder layers finish.
+- Draw `cache.advance` outside the repeated layer loop, after all 32 layers, not
+  as an operation that runs after every single layer.
+- If attention scores are rendered, use only per-head GQA scoring:
+  `Q_i [q_seq,128] * K_g^T [128,kv_seq] -> S_i [q_seq,kv_seq]`, scaled by
+  `1/sqrt(HEAD_DIM)`.
+
+Do-not-render rules
+- Do not render most guardrail facts. They are accuracy constraints, not image
+  content.
+- Do not invent source file names. If source labels appear, use only:
+  `config.h`, `kernel/rope.cu`, `src/inference_loop.cu`,
+  `src/inference_layer.cu`, `src/inference_internal.h`.
+- Do not show a separate GPS coordinate vector, learned position embedding,
+  appended position column, or extra position tensor.
+- Do not show V being rotated.
+- Do not show even/odd RoPE pairs such as `(0,1)` or `(2,3)`.
+- Do not use base 10000 in any formula, label, table, or warning.
+- Do not show old cached K rows being rotated again during decode.
+- Do not show RoPE as one global operation before all layers.
+- Do not draw `cache.advance` inside one decoder layer or immediately after each
+  layer's attention box.
+- Do not show `d_cos_step` / `d_sin_step` being recomputed before each decoder
+  layer.
+- Do not omit the `Key Area 3` title or replace it with only the top bridge.
+- Do not place `absolute_pos = len_before + local_pos` inside the literal
+  kernel code. If needed, show it only as a conceptual label outside code.
+- Do not show packed `Q [rows,4096]` multiplied by packed `K [kv_seq,1024]`.
+- Do not turn the poster into a checklist or table of every constant.

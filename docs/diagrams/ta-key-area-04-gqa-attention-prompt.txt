@@ -1,0 +1,180 @@
+Create a high-resolution educational infographic for CS265 TA prep.
+
+Title:
+Key Area 4: GQA Attention
+
+Knowledge-transfer goal:
+The viewer should understand the core story in 10 seconds and be able to
+explain it out loud in under 60 seconds. Prioritize readable teaching over
+complete implementation coverage.
+
+Core story:
+Grouped Query Attention keeps 32 query heads, but shares only 8 key/value
+heads, so every 4 query heads reuse one K/V group. For one query head, attention
+scores Q against the matching K group, blocks future key positions when doing
+square prefill, turns scores into stable softmax weights, and uses those weights
+to mix the matching V group. The 32 per-head outputs are stitched back into a
+4096-wide attention result; output projection and residual happen after this
+diagram.
+
+Hard readability rules:
+- Output 16:9, 3840 x 2160 or larger.
+- Use 4 main panels plus one small TA answer box, one trap strip, and one source
+  strip.
+- Maximum 180 visible words total, excluding tiny source labels.
+- No paragraphs inside the image.
+- Use arrows, brackets, tensor blocks, matrices, and shape labels instead of
+  prose.
+- Minimum body text must be readable at 100% zoom.
+- If space is tight, delete secondary detail before shrinking text.
+- Delete decorative labels before deleting core formulas.
+- Do not render long file paths in the main panels.
+- Do not include dense tables, code blocks, or checklists.
+
+Visual style:
+- White background, crisp dark text, clean vector technical study-poster layout.
+- Purple = query heads.
+- Blue = K/V cache tensors.
+- Green = CUDA/GPU operations.
+- Orange = Value mixing.
+- Red = causal-mask and misconception warnings.
+- Use one large left-to-right flow with clear panel boundaries.
+
+Visible content to render:
+
+Title and subtitle:
+- Key Area 4: GQA Attention
+- 32 Q share 8 K/V: match, mask, mix.
+
+Panel 1: Head Sharing
+- `32 Q heads`
+- `8 K/V heads`
+- `4 Q -> 1 K/V`
+- `g = floor(i / 4)`
+- label: `same-layer K/V cache`
+
+Panel 2: One Head Scores
+- `Q_i [q_seq,128]`
+- `x K_g^T [128,kv_seq]`
+- `= S_i [q_seq,kv_seq]`
+- `scale 1/sqrt(128)`
+- label: `match strength`
+
+Panel 3: Mask Then Softmax
+- Prefill `[s,s]`: row `q`, col `p`; mask future keys `p > q`
+- Decode `[1,kv_seq]`: no square mask
+- stable softmax: subtract row max
+- label: `weights`
+
+Panel 4: Mix and Stitch
+- `weights x V_g [kv_seq,128]`
+- `-> O_i [q_seq,128]`
+- `32 O_i blocks`
+- `-> O [q_seq,4096]`
+- `next: W_O + residual`
+
+Small TA answer box:
+Render exactly this short script:
+"GQA keeps 32 Q heads but only 8 K/V heads. Each Q scores its K group, softmax
+makes weights, then weights mix V."
+
+Small trap strip:
+Render as a small red "Do not say" strip:
+- 32 K/V heads
+- V gets RoPE
+- decode square mask
+- final layer output
+- 32 S buffers at once
+
+Bottom source strip:
+Use only these anchors, in tiny text:
+- `docs/assignment/llm_part2.md`
+- `src/inference_layer.cu`
+- `kernel/attention.cu`
+- `kernel/matmul.cu`
+- `include/kv_cache.h`
+- `config.h`
+
+Guardrail facts the image must obey but should not render unless listed above:
+- Llama 3 uses GQA, not standard MHA.
+- `NUM_HEADS = 32`, `NUM_KV_HEADS = 8`, `HEAD_DIM = 128`,
+  `EMBEDDING_DIM = 4096`.
+- `KVCache::kv_dim() = NUM_KV_HEADS * HEAD_DIM = 1024`.
+- Q has width `32 * 128 = 4096`; K and V have width `8 * 128 = 1024`.
+- For query head `i`, the K/V group is
+  `g = floor(i / (h / h_k)) = floor(i / 4)`.
+- Query head `i` compares with K from the same decoder layer's current/cached
+  token positions, not with K from previous layers.
+- RoPE happens before attention and only affects Q and K. V is not rotated.
+- K and V are written into the KV cache during projection. RoPE is applied to
+  the newly written K rows. Attention reads cached K/V over the valid prefix.
+- Attention reads cache rows `[0, kv_seq)`, not the full allocated `S_MAX`
+  capacity.
+- `kv_seq = len_before + q_seq`.
+- Assignment prefill shape is `[s,s]`.
+- Repo cached attention shape is `[q_seq,kv_seq]`.
+- Per-head score shape is
+  `Q_i [q_seq,128] * K_g^T [128,kv_seq] -> S_i [q_seq,kv_seq]`.
+- Scale is exactly `1 / sqrt(HEAD_DIM) = 1 / sqrt(128)`.
+- The causal mask sets future key columns `p > q` to a large negative sentinel
+  (repo kernel condition: `col > row`).
+- Mask axes: `q` is the query row on the vertical axis; `p` is the key-position
+  column on the horizontal axis. The red masked region is above the diagonal.
+- The assignment describes `-inf`; this repo's kernel writes `-1e6f`.
+- `run_attention_heads` applies `gpu_causal_mask` only when
+  `q_seq == kv_seq && q_seq > 1`, the square prefill case.
+- Decode uses `q_seq = 1` and skips the square causal mask because the one new
+  query row attends only over the already-valid cached prefix.
+- Do not draw an upper-triangle mask on rectangular decode attention
+  `[1,kv_seq]`.
+- Stable softmax subtracts the row maximum before exponentiation:
+  `exp(S[q,p] - row_max) / sum_k exp(S[q,k] - row_max)`.
+- `O_i = alpha_i * V_g` has shape `[q_seq,128]`.
+- Concatenating all 32 `O_i` blocks produces `O [q_seq,4096]`.
+- GQA returns the stitched attention result. Output projection `W_O`, residual,
+  post-attention RMSNorm, FFN, and the next residual happen after this.
+- `run_attention_heads` loops over all 32 query heads for one batch slot at a
+  time.
+- One `AttentionScratch` object is allocated per `forward_step` and reused for
+  every layer, batch slot, and head:
+  `d_Qi [q_seq,128]`, `d_KgT [128,kv_seq]`, `d_Vg [kv_seq,128]`,
+  `d_S [q_seq,kv_seq]`, `d_Oi [q_seq,128]`.
+- This implementation reuses one scratch score buffer `scratch.d_S`; do not
+  depict 32 simultaneous score matrices as the repo implementation.
+- The assignment may discuss all 32 score matrices at once as a thought
+  experiment; that is not how this implementation allocates scores.
+- `gpu_gather_head` slices Q and V.
+- `gpu_gather_head_transpose` slices K and writes `K_g^T`.
+- `gpu_matmul_device` performs `Q_i * K_g^T` and `softmax(S) * V_g`.
+- `gpu_scale`, `gpu_causal_mask`, `gpu_softmax`, and `gpu_scatter_head` perform
+  the other per-head attention steps.
+- Gather/scatter stays on GPU; do not imply host round trips for per-head
+  slices.
+- Current generation uses full-prompt prefill and then one-token decode steps.
+- Multi-token generation is supported as a loop of one-token decode steps. Do not
+  imply one decode `forward_step` processes multiple new tokens at once
+  (`q_seq > 1`), and do not imply mixed-length batched prompts are supported.
+
+Do-not-render rules:
+- Do not render most guardrail facts.
+- Do not render implementation loop details unless they are in visible content.
+- Do not render the full list of CUDA helper functions in the main panels.
+- Do not render a large 8-row GQA grouping table.
+- Do not render 10 TA questions.
+- Do not render long formulas beyond the two core formulas listed in visible
+  content.
+- Do not render packed `Q [q_seq,4096] * K [kv_seq,1024]`; those packed shapes
+  are not directly multiplied.
+- Do not show GQA comparing against previous layers.
+- Do not show K/V as 32 heads.
+- Do not rotate V.
+- Do not show attention reading all `S_MAX` rows.
+- Do not show all 32 score matrices materialized at once for this repo.
+- Do not show the prefill upper-triangle mask on decode `[1,kv_seq]`.
+- Do not label the masked prefill region as `q > p`; the correct visible label
+  is future keys `p > q`.
+- Do not render "multi-token generation unsupported"; only multi-new-token
+  decode steps and mixed-length batched prompts are unsupported.
+- Do not imply the attention output is the final layer output.
+- Do not invent source file labels. Use only the bottom source strip labels or
+  omit file labels.

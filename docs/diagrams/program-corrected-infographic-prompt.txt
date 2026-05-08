@@ -1,0 +1,302 @@
+Create a high-resolution educational technical infographic that closely matches the visual style, density, layout, and polish of the existing reference image `program.png`, but correct the content for the current repository implementation.
+
+Canvas and style:
+- Output a polished 16:9 infographic, high resolution, suitable for export at 2400 x 1350 or larger.
+- White background, subtle shadows, crisp vector-like shapes, rounded rectangular panels, clean arrows, small icons, and dense but readable technical text.
+- Overall visual style should look like a systems/programming architecture poster: precise, structured, colorful, and highly annotated.
+- Use the same general layout as the reference: large title at top, handoff overview strip under title, legend strip, six numbered main panels across the middle, a "Big Picture" strip at the bottom, and a compact legend at bottom-right.
+- Use blue for CPU/host steps, green for GPU/device/inference steps, gold/orange for generated outputs, purple for position/RoPE notes, red/pink for residual connection notes.
+- Use numbered circles for the six main panels.
+- Use small chip, file, terminal, matrix/grid, arrow, crown/argmax, and console icons where helpful.
+- Keep all text sharp and readable. Do not distort code names, token IDs, file names, or function names.
+
+Title:
+LLM Inference Flow: From main.cpp to Generated Tokens
+
+Subtitle:
+How control moves from CLI argument parsing into the split inference module and through the neural network pipeline
+
+Important accuracy constraints:
+- This repo no longer has one monolithic `src/inference.cu` implementation. Show `src/inference.cu` as a thin public facade only.
+- Show the split inference module:
+  - `src/inference.cu` = public API facade declared by `include/inference.h`
+  - `src/inference_chat.cu` = Llama 3 Instruct chat template
+  - `src/inference_loop.cu` = generation driver/orchestration; sets up KV cache and RoPE tables; calls `forward_step()` for prefill and decode; does NOT own the 32-layer decoder loop
+  - `src/inference_layer.cu` = implements `forward_step()`; owns/runs the 32-layer decoder loop; handles decoder-block math, GQA orchestration, final RMSNorm, and CPU `lm_head` logits helper
+- Important ownership wording: `inference_loop.cu` decides when to run prefill/decode, while `inference_layer.cu` executes the neural-network layer stack inside `forward_step()`.
+- Do not show unsupported CLI flags. The current CLI supports only:
+  - `--max-tokens N`
+  - `--prompt P` repeated for batched prompts
+  - `--interactive`
+  - one positional prompt
+- Do NOT include `--model`, `--batch`, `--temp`, temperature, sampling, top-p, or model-file flags.
+- The stop token is `EOT_ID = 128009`, not 128001.
+- `lm_head` is a separate checkpoint tensor in this repo. Do not say it is tied/shared with embeddings. The code uses `global/lm_head_weight.bin`.
+- The current output logits are computed on CPU by `compute_lm_head_logits()` from `src/inference_layer.cu`, using the last hidden vector and `lm_head`.
+- The generation method is greedy argmax, not sampling.
+
+Top strip: "PRE-STAGE: HANDOFF OVERVIEW"
+Left top box: `main.cpp`
+- Show a `.cpp` file icon and a terminal/gear icon.
+- Text:
+  - Parses CLI arguments
+  - Supports `--max-tokens`, `--prompt`, `--interactive`
+  - Loads `ModelWeights`
+  - Creates `DeviceModelWeights` only for resident paths
+  - Chooses execution path based on prompt count and max tokens
+  - Detokenizes generated IDs with `decode_token(id)`
+- Include a small terminal command sample:
+  `./bin/llm --max-tokens 50 --prompt "Explain KV cache."`
+- Add a small note: "No --model, --batch, or --temp flags in current main.cpp"
+
+Arrow from `main.cpp` to inference module:
+- Label: "handoff to inference API"
+
+Middle top box: "split inference module"
+- Show a green `.cu` file icon.
+- Text:
+  - `src/inference.cu`: public facade
+  - `src/inference_chat.cu`: chat template
+  - `src/inference_loop.cu`: generation driver, calls `forward_step`
+  - `src/inference_layer.cu`: `forward_step` executor, owns 32-layer loop
+- Small caption: "CUDA kernels + host orchestration + neural network logic"
+
+Right top box: "Entry points from include/inference.h"
+- Show three CLI-relevant public API rows:
+  1. `generate_next_token()` - one prompt, one greedy token, cheapest path
+  2. `generate_tokens_resident()` - single prompt, multi-token decode with resident BF16 weights
+  3. `generate_tokens_resident(...)` batched overload - takes `const std::vector<std::string>& prompts` and generates multiple prompts in lockstep
+- Optional smaller note: "Nonresident `generate_tokens()` and debug APIs also exist for tests."
+
+Far-right dashed call-chain box:
+- Title: "Actual internal call chain"
+- Text:
+  - public facade in `src/inference.cu`
+  - delegates to `*_impl` functions in `src/inference_loop.cu`
+  - `src/inference_loop.cu` orchestrates prefill/decode and calls `forward_step()`
+  - `src/inference_layer.cu` implements `forward_step()` and runs the 32-layer decoder loop
+  - kernel helpers live in `kernel/*.cu`
+
+Legend strip under top overview:
+- CPU-side host memory = blue
+- GPU-side device memory = green
+- Input/output = gold
+- Data flow = solid arrow
+- Control flow / loop = dashed arrow
+
+Main panel 1, blue, title:
+1. Tokenization
+subtitle: `(src/inference_chat.cu)`
+Content:
+- Raw text prompt is sent to `BPETokenizer`
+- `apply_chat_template()` wraps the prompt for Llama 3 Instruct
+- Output becomes a sequence of integer token IDs
+- M1 bare tokenizer tests still use raw tokenization; end-to-end inference uses the chat template
+- Stop/end-of-turn token is `EOT_ID = 128009`
+Show a mini flow:
+Raw Text Prompt -> Chat Template (Llama 3) -> Token IDs
+Chat template detail:
+`<|begin_of_text|>`
+`<|start_header_id|> user <|end_header_id|>`
+blank line token `271`
+prompt tokens
+`<|eot_id|>` = `128009`
+`<|start_header_id|> assistant <|end_header_id|>`
+blank line token `271`
+Special token IDs to include:
+- `BEGIN_OF_TEXT = 128000`
+- `START_HEADER = 128006`
+- `END_HEADER = 128007`
+- `NEWLINE_NEWLINE = 271`
+- `USER_TOKEN = 882`
+- `ASSISTANT_TOKEN = 78191`
+- `EOT_ID = 128009`
+
+Main panel 2, blue, title:
+2. Embedding Lookup
+subtitle: `(ModelWeights::get_embeddings)`
+Content:
+- Token IDs are passed to `ModelWeights`
+- Weights live in CPU RAM initially
+- Each token ID maps to one 4096-dimensional vector
+- Output is an embeddings matrix `[seq_len, 4096]`
+- In batched mode, prompts are stacked into `[batch, seq_len, 4096]`
+Visual:
+- Left column of token IDs such as `128000`, `128006`, `882`, `128007`, `271`, `...`
+- Arrow into a blue embedding-table grid
+- Arrow to a floating-point embeddings matrix labeled `[seq_len, hidden_dim]` and `hidden_dim = 4096`
+
+Main panel 3, green, title:
+3. KV Cache Allocation
+subtitle: `(src/kv_cache.cu)`
+Content:
+- Allocated before `forward_step`
+- Lives in GPU VRAM
+- Stores Key and Value matrices for every decoder layer
+- `S_MAX = 1024`
+- Used by multi-token decode to reuse previous context instead of recomputing old K/V
+- In prefill, the cache is populated for the full prompt
+- In decode, one new K row and one new V row are appended per generated token
+Visual:
+- GPU VRAM card with two grids labeled "Keys (K)" and "Values (V)"
+- Caption: "Acts as the model's working memory during decode"
+
+Main panel 4, green, largest center panel, title:
+4. Prefill Phase - Heavy Forward Pass
+subtitle:
+`forward_step(q_seq = prompt_len)` processes the full prompt through all 32 layers once
+Content:
+- Input: full prompt embeddings `[seq_len, 4096]`
+- `src/inference_loop.cu` calls `forward_step()` for prefill
+- `src/inference_loop.cu` is the driver/orchestrator, not the owner of the layer stack
+- `src/inference_layer.cu` implements `forward_step()` and runs the 32-layer decoder loop
+- `NUM_LAYERS = 32`
+- `EMBEDDING_DIM = 4096`
+- `NUM_HEADS = 32`
+- `NUM_KV_HEADS = 8`
+- `HEAD_DIM = 128`
+- `FFN_DIM = 14336`
+Visual inside the panel:
+- Left: vertical stack of full prompt embedding rows labeled positions `0`, `1`, `2`, `...`, `n-1`
+- Middle: dashed tall box labeled "Llama 3 - 32 Decoder Blocks" with blocks:
+  - Block 0
+  - Block 1
+  - Block 2
+  - ...
+  - Block 30
+  - Block 31
+- Right: inset card titled "Inside One Decoder Block"
+Inside One Decoder Block card must show this exact order:
+1. `RMSNorm` - stabilizes/scales each token vector; epsilon `1e-5`
+2. `Q/K/V Projections` - matmul projections into Query, Key, Value
+3. `RoPE` - position fingerprint on Q and new K; base `500000`; V is not rotated
+4. `GQA` - 32 Q heads share 8 K/V heads; score Q vs K, causal mask, softmax, mix V
+5. `Output Projection + Residual #1` - `X = X + attn_out`
+6. `RMSNorm + SwiGLU FFN` - gate/up projections, SiLU gate, feature filtering
+7. `Down Projection + Residual #2` - `X = X + ffn_out`
+Bottom caption:
+"Prefill processes the entire prompt through all 32 layers once and fills the KV cache."
+Right side of panel:
+- Show "Final RMSNorm"
+- Show "copy last hidden state `[batch, 4096]` back to CPU"
+
+Main panel 5, green, title:
+5. Decode Phase - Autoregressive Loop
+subtitle:
+Runs when more than one token is requested
+Content as lettered steps:
+A. Take the final hidden state from prefill or previous decode step
+B. CPU `compute_lm_head_logits()` projects through `global/lm_head_weight.bin`
+C. Produce logits over full vocabulary `VOCAB_SIZE = 128256`
+D. Select the most likely token using greedy argmax
+E. Embed the generated token and run `forward_step(q_seq = 1)`
+F. Append one new K/V row to the KV cache and attend over the full cached prefix
+G. Repeat until `max_new_tokens` limit or `EOT_ID = 128009`
+Important text:
+- "No temperature/sampling path in current CLI"
+- "Batched prompts advance in lockstep and require equal tokenized lengths"
+Visual:
+- A looping green arrow from generated token back into one-token embedding
+- Label the hidden state as `[batch, 4096]`; if showing a single-prompt mini-example, note that `[1, 4096]` is just the B=1 case.
+- A small crown/argmax icon
+- A logits bar chart icon labeled `128,256 vocab scores`
+- A cache grid icon showing previous tokens reused
+
+Main panel 6, gold, title:
+6. Return and Detokenization
+subtitle: `(main.cpp calls src/inference.cu::decode_token)`
+Content:
+- Inference returns generated token IDs
+- `main.cpp` loops over generated IDs
+- `decode_token(id)` is implemented in `src/inference.cu`
+- `decode_token(id)` converts each ID to text using `BPETokenizer`
+- Full output is printed to the console
+Visual:
+- A row of generated token IDs, for example `9125 357 9552 ...`
+- Arrow to "`main.cpp` calls `src/inference.cu::decode_token(id)`"
+- Arrow to "Decoded Text"
+- Console output box showing:
+  `prompt + decoded completion`
+
+Bottom strip: "Big Picture"
+Use four cards plus a legend.
+Card 1:
+`main.cpp` decides the execution path; the split inference module performs actual inference.
+Small mini-flow:
+`main.cpp -> src/inference.cu facade -> src/inference_loop.cu -> src/inference_layer.cu`
+Tiny caption under mini-flow:
+"`inference_loop.cu` drives prefill/decode; `inference_layer.cu` executes `forward_step` and the 32-layer loop."
+Card 2:
+Prefill = process the full prompt once.
+Small caption:
+"Cost grows with prompt length; attention work grows fastest."
+Card 3:
+Decode = generate one token at a time autoregressively.
+Card 4:
+KV cache = reuse old K/V so each decode step does not recompute the whole prefix.
+Optional Card 5:
+Resident BF16 weights = multi-token paths keep layer weights in GPU VRAM after upload.
+
+Bottom-right quick reference legend:
+- CPU RAM / host memory
+- GPU VRAM / device memory
+- Token IDs
+- Embeddings / matrices
+- Hidden states / activations
+- Logits
+- Output token
+- Console output
+- Data arrow
+- Loop arrow
+
+Exact file labels to use:
+- `main.cpp`
+- `include/inference.h`
+- `src/inference.cu`
+- `src/inference_chat.cu`
+- `src/inference_loop.cu`
+- `src/inference_layer.cu`
+- `src/kv_cache.cu`
+- `kernel/rmsnorm.cu`
+- `kernel/matmul.cu`
+- `kernel/rope.cu`
+- `kernel/attention.cu`
+- `kernel/swiglu.cu`
+- `kernel/residual.cu`
+
+Exact function labels to use:
+- `generate_next_token()`
+- `generate_tokens_resident()`
+- `generate_tokens_resident(const std::vector<std::string>& prompts, int max_new_tokens)`
+- `generate_next_token_impl()`
+- `generate_tokens_impl()`
+- `generate_tokens_resident_batched_impl()`
+- `apply_chat_template()`
+- `forward_step()`
+- `compute_lm_head_logits()`
+- `decode_token(id)`
+- `gpu_rmsnorm`
+- `gpu_rope`
+- `run_attention_heads`
+- `gpu_swiglu`
+- `gpu_residual_add`
+
+Visual correction notes to enforce:
+- Do not label `src/inference.cu` as the whole "core inference engine"; label it as the public facade.
+- Do not say `src/inference_loop.cu` runs the 32-layer decoder loop. Correct wording: `src/inference_loop.cu` calls `forward_step()`; `src/inference_layer.cu` owns/runs the 32-layer decoder loop.
+- Do not imply `decode_token(id)` is implemented in `main.cpp`; `main.cpp` calls `decode_token(id)`, and `decode_token(id)` is implemented in `src/inference.cu`.
+- Do not label the general last hidden state as `[1, 4096]`; use `[batch, 4096]`, with `[1, 4096]` only as the single-prompt B=1 case.
+- Do not say prefill cost is exactly "proportional to prompt length"; safer wording is "cost grows with prompt length; attention work grows fastest."
+- Do not claim "all paths reach generate_tokens_impl()"; the current call chain uses several `*_impl` functions in `src/inference_loop.cu`.
+- Do not show `lm_head` as GPU output projection; the current code computes logits on CPU via `compute_lm_head_logits()`.
+- Do not say `lm_head` shares weights with the embedding table.
+- Do not use `128001` as EOT; use `128009`.
+- Do not include unsupported CLI flags.
+- Do not include sampling controls such as temperature.
+- Do not imply mixed-length batching is supported; show equal-length lockstep batching only.
+
+Text density target:
+- Match the density of `program.png`: many small but readable callouts, compact bullets, code labels, and diagrams.
+- Use dense panels but avoid overlapping text.
+- Keep panel titles large and readable.
+- Use code font styling for function names, token IDs, dimensions, and file paths.

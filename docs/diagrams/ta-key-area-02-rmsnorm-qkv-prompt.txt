@@ -1,0 +1,144 @@
+Title
+Key Area 2: RMSNorm -> Q/K/V
+
+Knowledge-transfer goal
+Create a clean 16:9 CS265 TA-prep infographic that teaches the first attention pre-block:
+
+`X -> RMSNorm -> X_norm -> Q, K, V projections`
+
+The viewer should understand the main idea in 10 seconds and be able to explain it out loud in under 60 seconds.
+
+Core story
+RMSNorm prepares each token row before attention by rescaling the row's RMS magnitude and applying learned `gamma`; it does not change the shape and it does not mix tokens. The normalized matrix then goes through three learned projection matmuls to produce Query, Key, and Value roles. Q stays 4096-wide because there are 32 query heads, while K and V are 1024-wide because Llama 3 uses 8 shared KV heads for grouped-query attention. In this repo, K and V projection outputs are written directly into `KVCache`; Q is used for the current attention step.
+
+Hard readability rules
+- Use 3 to 5 main panels only.
+- Cap all visible text at 120 to 180 words total, including title, labels, TA box, trap strip, and source strip.
+- Use arrows, matrix blocks, branch shapes, color, and short labels before using sentences.
+- Main-panel labels should be 12 words or fewer. The TA answer may wrap across
+  several readable lines.
+- Keep formula text large enough to read without zooming.
+- If text does not fit, delete secondary detail before shrinking text.
+- Delete in this order: implementation details, weight storage details, source strip detail, TA script detail, then formula detail.
+- Never shrink text below readable poster size to preserve extra facts.
+- Render exact constants and shapes; do not invent dimensions.
+
+Visual style
+- White background with crisp technical diagrams and restrained color.
+- Blue: input and normalized token matrices.
+- Green: RMSNorm / CUDA operation.
+- Purple: Q, K, V branches and attention roles.
+- Red: misconception strip only.
+- Use simple matrix icons, arrows, branch lines, and compact file labels.
+- Prefer visual contrast: "same shape" for RMSNorm, "wide Q vs narrow K/V" for GQA.
+
+Visible content to render
+Main title:
+`Key Area 2: RMSNorm -> Q/K/V`
+
+Subtitle:
+`RMSNorm prepares each row; Q/K/V choose attention roles`
+
+Panel 1 - Input rows:
+Show matrix `X [s,4096]`.
+Label rows as token vectors.
+Callout: `Each row is normalized independently`.
+
+Panel 2 - RMSNorm:
+Show one row flowing through RMSNorm:
+`rms(x)=sqrt(mean(x_i^2)+1e-5)`
+`y_i=(x_i/rms(x))*gamma_i`
+Shape badge: `[s,4096] -> [s,4096]`
+Callout: `rescales, does not mix tokens`.
+
+Panel 3 - Three projections:
+From `X_norm [s,4096]`, draw three branches:
+`Q [s,4096] = 32*128` - `what each row asks for`
+`K [s,1024] = 8*128` - `what each row matches on`
+`V [s,1024] = 8*128` - `what each row can contribute`
+Add a clear contrast label: `GQA: 32 Q heads share 8 K/V heads`.
+
+Panel 4 - Repo connection:
+Show Q used immediately for the current rows; Q is not cached.
+Show K and V arrows writing/appending into `KVCache`.
+Short label: `attention reads cache now; future steps reuse K/V`.
+
+Small TA answer box
+Header: `60-second answer`
+
+Text to render:
+`First RMSNorm rescales each token row independently: [s,4096] stays [s,4096]. Then three learned matmuls make Q [s,4096], K [s,1024], and V [s,1024]. Q asks, K matches, V carries information. K/V are narrower because GQA shares 8 KV heads across 32 Q heads. This repo writes K/V rows straight into KVCache.`
+
+Small trap strip
+Header: `Do not say`
+
+Render only these red trap labels:
+- `RMSNorm subtracts the mean`
+- `epsilon goes outside sqrt`
+- `RMSNorm mixes tokens`
+- `skip gamma`
+- `K/V are 4096-wide`
+- `K/V are recomputed instead of cached here`
+
+Bottom source strip
+Render as a tiny but readable footer:
+`llm_part2.md Section 2 | config.h | kernel/rmsnorm.cu gpu_rmsnorm | src/inference_layer.cu forward_step | include/model_weights.h + include/device_weights.h`
+
+Guardrail facts the image must obey but should not render unless listed
+- Assignment base mental model is B=1: `X [s,d]`, `d=4096`.
+- `s` is sequence length.
+- `EMBEDDING_DIM = 4096`.
+- `RMS_NORM_EPSILON = 1e-5`.
+- `NUM_HEADS = 32`.
+- `NUM_KV_HEADS = 8`.
+- `HEAD_DIM = 128`.
+- `KVCache::kv_dim() = NUM_KV_HEADS * HEAD_DIM = 1024`.
+- RMSNorm formula: `rms(x)=sqrt((1/d)*sum_i(x_i^2)+epsilon)`.
+- RMSNorm output formula: `y_i=(x_i/rms(x))*gamma_i`.
+- `gamma [d]` is learned per element and must be applied.
+- Epsilon is inside the square root.
+- RMSNorm is row-wise and does not subtract the mean.
+- RMSNorm maps `[s,4096]` to `[s,4096]`.
+- Q projection math: `Q = X_norm * W_Q^T`, output `[s,4096] = [s,32*128]`.
+- K projection math: `K = X_norm * W_K^T`, output `[s,1024] = [s,8*128]`.
+- V projection math: `V = X_norm * W_V^T`, output `[s,1024] = [s,8*128]`.
+- Checkpoint Q weight shape is `[4096,4096]`.
+- Checkpoint K/V weight shape is `[1024,4096]`.
+- Runtime transposed Q weight shape is `[4096,4096]`.
+- Runtime transposed K/V weight shape is `[4096,1024]`.
+- `src/model_weights.cpp` transposes checkpoint weights once at load time for the streamed FP32 path.
+- `include/model_weights.h` documents transposed FP32 runtime shapes.
+- `include/device_weights.h` documents resident BF16 transposed projection shapes.
+- Resident BF16 path and streamed FP32 path use the same math.
+- RMSNorm gammas remain FP32 in the resident path.
+- `kernel/rmsnorm.cu` implements `gpu_rmsnorm(...)`.
+- `gpu_rmsnorm(...)` uses one CUDA block per row, 256 threads, and shared-memory reduction.
+- In the live code, `forward_step(...)` calls pre-attention `gpu_rmsnorm`, then Q/K/V projection matmuls.
+- Streamed FP32 projections use `gpu_matmul_device`.
+- Resident BF16 projections use `gpu_matmul_device_bf16_weight`.
+- In the live code, Q is computed into `d_Q`.
+- In the live code, K and V matmuls write directly to `cache.k_at(layer, len_before, b)` and `cache.v_at(layer, len_before, b)`.
+- Panel 4 applies to both prompt prefill (`q_seq=s`) and one-token decode
+  (`q_seq=1`). Do not label it as only a "current decoding step".
+- Base assignment does not require batching or KV caching; this repo has optional batching and KV cache support.
+- Live code uses `rows = batch * q_seq`; the poster should teach `[s,4096]` first and treat batching as hidden implementation detail.
+- During prefill, K/V rows for the prompt are written.
+- During decode, one new K row and one new V row are appended.
+- RoPE happens after Q/K/V projection and rotates Q plus newly written K rows, not V. Do not make RoPE a main visual in this image.
+- Q compares against K from the same layer's current/cached sequence, not against earlier layers.
+- `lm_head` behavior is outside this infographic and should not be discussed.
+
+Do-not-render rules
+- Do not render a dense source-of-truth checklist.
+- Do not render all constants as a table.
+- Do not render a separate streaming-vs-resident implementation panel.
+- Do not render CUDA block/thread details unless there is empty space after all main content is readable.
+- Do not render long file paths inside the main panels.
+- Do not render more than one formula block.
+- Do not render more than one TA answer box.
+- Do not render a multi-question FAQ.
+- Do not render performance profiling, HBM traffic, Nsight, or arithmetic-intensity notes.
+- Do not render RoPE, attention scores, softmax, output projection, FFN, final norm, logits, or `lm_head`.
+- Do not omit the `Key Area 2` title or replace it with only the subtitle.
+- Do not use tiny footnotes to preserve facts. Delete secondary facts instead.
+- Do not turn guardrail facts into visible checklist items.

@@ -79,7 +79,7 @@ __global__ void swiglu_kernel(const float *__restrict__ gate,
                               int count) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-
+    // the kernal is these three lines
     float g = gate[i];
     float silu = g / (1.0f + expf(-g));
     output[i] = silu * up[i];

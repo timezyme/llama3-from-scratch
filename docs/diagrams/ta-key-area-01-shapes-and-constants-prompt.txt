@@ -1,0 +1,151 @@
+Title
+Key Area 1: Shapes and Constants in Llama 3 Inference
+
+Knowledge-transfer goal
+Create a high-resolution 16:9 educational infographic for CS265 TA prep. The viewer should understand the main idea in 10 seconds: tensor shapes line up because the model repeatedly returns to the same hidden width, `[s,4096]`, after temporary attention and FFN reshapes. In under 60 seconds, the viewer should be able to explain what `s`, `d`, heads, K/V sharing, `d_ff`, vocab logits, and the repo-specific `lm_head` exception mean.
+
+Core story
+Token IDs become a matrix with one row per token and 4096 columns per hidden vector. Attention splits that width into heads: Q uses 32 heads, but K/V use only 8 heads, so this Llama 3 checkpoint uses Grouped Query Attention. Attention and the FFN temporarily change the internal shape, then project back to `[s,4096]` so residual additions are valid. After 32 decoder blocks, the repo scores only the last hidden vector with a separate `[128256,4096]` `lm_head`.
+
+Hard readability rules
+- Render exactly 5 main panels. If space is tight, shorten labels; do not merge
+  the decoder-block panel with the output-layer panel.
+- Cap all visible text, including title, labels, TA box, trap strip, and source strip, at about 120-180 words total.
+- Prefer arrows, matrix tiles, bracket labels, head-group diagrams, and shape contrasts over paragraphs.
+- If any label becomes small, delete secondary detail before shrinking text.
+- Never render a dense constants table. Show only the constants needed to explain the shape story.
+- Keep every visible label large enough to read on a presentation slide.
+- Use short labels with exact shapes. Do not wrap long file paths into the main diagram.
+- Make `s` visually vertical rows and `d=4096` visually horizontal width.
+- Make Q visibly wider than K/V before the head-group diagram.
+- Use one small red trap strip, not scattered warning callouts.
+
+Visual style
+- Polished 16:9 technical study poster, suitable for 2400 x 1350 or larger.
+- White background, crisp vector-like panels, thin arrows, matrix blocks, compact math labels, and clean spacing.
+- Use blue for tokenization/host concepts, green for model tensors, purple for attention-head layout, orange/gold for logits and token generation, and red only for traps.
+- No decorative filler. Every visual element should teach one shape relationship.
+
+Visible content to render
+Render this content as the actual infographic text. Keep it concise and do not add extra explanatory paragraphs.
+
+Top title:
+`Key Area 1: Shapes and Constants`
+
+Subtitle:
+`One rule: temporary reshapes must return to [s,4096].`
+
+Panel 1: Rows and width
+`IDs [s] -> X [s,4096]`
+`s = rows; d = 4096 columns`
+
+Panel 2: GQA split
+`Q: 32 x 128 -> [s,4096]`
+`K,V: 8 x 128 -> [s,1024]`
+`4 Q heads share 1 K/V`
+
+Panel 3: Attention rejoins
+`[s,128] x [128,s] -> [s,s] -> [s,128]`
+`concat 32 heads -> [s,4096]`
+
+Panel 4: Block stays addable
+`RMSNorm/RoPE keep shape`
+`FFN [s,4096] -> [s,14336] -> [s,4096]`
+`repeat 32 blocks`
+
+Panel 5: Last row scores
+`After final norm: x_last [4096] -> separate lm_head [128256,4096]`
+`logits [128256] -> argmax token`
+
+Small TA answer box
+Title: `TA answer script`
+
+Visible text:
+`Say: s is token rows; d is hidden width. GQA makes K/V narrower than Q. Attention and FFN reshape inside, but residuals force [s,4096]. The untied lm_head scores only x_last.`
+
+Small trap strip
+Title: `Do not say`
+
+Visible text:
+`s=4096 | S_MAX is width | K/V=4096 | RoPE/RMSNorm change shape | tied lm_head`
+
+Bottom source strip
+Visible text:
+`Sources: docs/assignment/llm_part2.md | config.h | src/inference_internal.h | src/inference_layer.cu | src/model_weights.cpp`
+
+Guardrail facts the image must obey but should not render unless listed
+- Assignment notation:
+  - `s` = sequence length, the number of tokens currently processed.
+  - `d = 4096` = embedding and hidden dimension.
+  - `h = 32` = query heads.
+  - `h_k = 8` = key/value heads.
+  - `h_d = 128` = head dimension.
+  - `d = h * h_d = 32 * 128 = 4096`.
+  - `d_ff = 14336` = FFN/SwiGLU intermediate width.
+  - `V = 128256` = vocabulary size and logits size.
+  - The decoder block is repeated `32` times.
+- Repo constants from `config.h`:
+  - `EMBEDDING_DIM = 4096`
+  - `RMS_NORM_EPSILON = 1e-5`
+  - `NUM_HEADS = 32`
+  - `NUM_KV_HEADS = 8`
+  - `HEAD_DIM = 128`
+  - `FFN_DIM = 14336`
+  - `VOCAB_SIZE = 128256`
+  - `ROPE_BASE = 500000`
+  - `NUM_LAYERS = 32`
+- Repo internal constants from `src/inference_internal.h`:
+  - `S_MAX = 1024`
+  - `EOT_ID = 128009`
+- `S_MAX = 1024` is this project's working cap for KV cache and RoPE table allocation. It is not the model hidden width and not the learned context length.
+- The required assignment mental model is B=1, but the live repo also has batched generation. When describing live batched output, use `[batch,4096]`; when describing one next-token decision, use `x_last [4096]`.
+- `forward_step` in `src/inference_layer.cu` executes the 32-layer decoder stack and returns last hidden vectors. It does not return logits or token IDs.
+- Final RMSNorm happens after the 32 decoder blocks and before `x_last` is scored
+  by `lm_head`; do not draw `lm_head` or final norm inside a decoder block.
+- `src/inference_loop.cu` calls `forward_step`, then calls `compute_lm_head_logits`, then uses greedy argmax.
+- `compute_lm_head_logits` is CPU host code in this repo, not a CUDA kernel.
+- The checkpoint has `tie_word_embeddings=false`. The output head is separate from embeddings.
+- `src/model_weights.cpp` loads `global/lm_head_weight.bin` as stored `[V,d] = [128256,4096]`, row-major, so logits are computed as `lm_head [V,d] @ x_last [d]`.
+- If showing row-vector assignment math, label it as a math view only: `x_last [1,4096] x W_lm^T [4096,128256] -> logits [1,128256]`. Also keep the stored repo shape `[128256,4096]`.
+- K/V projection width is `NUM_KV_HEADS * HEAD_DIM = 8 * 128 = 1024`.
+- Q projection width is `NUM_HEADS * HEAD_DIM = 32 * 128 = 4096`.
+- GQA mapping: query head `i` reads K/V group `floor(i / 4)` because `NUM_HEADS / NUM_KV_HEADS = 4`.
+- A useful mini-diagram is 32 Q-head boxes grouped into 8 groups of 4, each group pointing to one K/V head.
+- Attention per query head may be shown as `Q_i [s,128] x K_g^T [128,s] -> scores [s,s]`, then `weights [s,s] x V_g [s,128] -> O_i [s,128]`.
+- Causal masking and softmax happen inside attention but are not the visual focus.
+- RMSNorm preserves `[s,4096]` and uses epsilon `1e-5`.
+- RoPE rotates Q and new K values but preserves tensor shape.
+- Residual additions require both operands to be `[s,4096]`.
+- FFN/SwiGLU expands each token row to `[s,14336]`, combines `SiLU(gate) * up`, then down-projects back to `[s,4096]`.
+- Only the last hidden vector is scored for next-token generation; projecting all `s` rows to vocab logits would be wasteful.
+- The stop token is `EOT_ID = 128009`, but it does not need to appear in this infographic unless there is room in a tiny guardrail note.
+- If exact checkpoint paths appear anywhere, use only these repo-style labels:
+  - `assets/llama3/dump/embeddings.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_self_attn_q_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_self_attn_k_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_self_attn_v_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_self_attn_o_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_mlp_gate_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_mlp_up_proj_weight.bin`
+  - `assets/llama3/dump/layer_00/model_layers_0_mlp_down_proj_weight.bin`
+  - `assets/llama3/dump/global/model_norm_weight.bin`
+  - `assets/llama3/dump/global/lm_head_weight.bin`
+
+Do-not-render rules
+- Do not render the full guardrail list.
+- Do not render a constants table.
+- Do not render a long TA Q/A checklist.
+- Do not render checkpoint file paths in the main flow.
+- Do not invent checkpoint labels.
+- Do not use Meta/HuggingFace-style labels such as `tok_embeddings.bin`, `blk.N`, `attn_wq.bin`, `attn_wk.bin`, `attn_wv.bin`, `ffn_gate.bin`, or `output.weight`.
+- Do not label the full shape trail as `(one decoder block)`. If a decoder-block sublabel is needed, use exactly `Inside one decoder block (repeated 32 times)`.
+- Do not merge Panel 5 into the decoder-block panel or imply `lm_head` is inside
+  a decoder block.
+- Do not draw `lm_head_weight.bin` as stored `[4096,V]` or `[4096,128256]`.
+- Do not imply `lm_head` is tied/shared with embeddings.
+- Do not show logits as coming out of `forward_step`.
+- Do not draw `lm_head` as a GPU kernel.
+- Do not show `S_MAX=1024` as an embedding dimension or hidden width.
+- Do not imply RMSNorm, RoPE, residual add, or output projection changes the final residual-stream shape.
+- Do not omit the `Key Area 1` title or replace it with only `Shapes and Constants`.
+- Do not add decorative panels, badges, sidebars, or tiny explanatory footnotes. Delete them before shrinking text.

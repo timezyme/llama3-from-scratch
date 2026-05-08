@@ -321,9 +321,12 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
             // one matmul per batch slot. This batched v1 layout is less
             // efficient than a strided 3D matmul.
             if (resident_lw != nullptr) {
+                // Q: one matmul call for the whole batch
                 gpu_matmul_device_bf16_weight(d_Xnorm, resident_lw->q_proj,
                                               d_Q, rows, d, d);
+                // K and V: one matmul call per batch slot
                 for (int b = 0; b < batch; ++b) {
+                    // K/V projections written into per-batch cache slices
                     const float *d_Xnorm_b =
                         d_Xnorm + static_cast<size_t>(b) * q_seq * d;
                     gpu_matmul_device_bf16_weight(
@@ -387,11 +390,13 @@ std::vector<float> forward_step(const float *h_input, int q_seq,
                 gpu_matmul_device_bf16_weight(d_attn, resident_lw->o_proj,
                                               d_attn_out, rows, d, d);
             } else {
+                // adds attention result back to the orig input X
                 gpu_matmul_device(d_attn, d_wo, d_attn_out, rows, d, d);
             }
             // Residual #1: X <- X + attn_out (in place on d_X).
             gpu_residual_add(d_X, d_attn_out, rows * d);
             if (resident_lw == nullptr) {
+
                 CUDA_CHECK(cudaMemcpy(d_gamma, lw->post_attn_layernorm,
                                       d * sizeof(float),
                                       cudaMemcpyHostToDevice));

@@ -1,0 +1,137 @@
+Title
+
+Key Area 5: Decoder Block = Two Residual Updates
+
+Knowledge-transfer goal
+
+Create a clean 16:9 CS265 TA-prep infographic that teaches the decoder block story in 10 seconds. A student should be able to explain it out loud in under 60 seconds: one layer keeps the residual stream shape, adds an attention update, then adds a SwiGLU FFN update.
+
+Core story
+
+One decoder block is two "keep X, add an update" moves. First, attention gathers cross-token context and projects it back to the residual-stream shape, so `X = X + attn_out` is valid. Second, after a separate post-attention RMSNorm, the FFN expands each token row to a larger SwiGLU space, gates it, projects it back to the residual-stream shape, then adds it with `X = X + ffn_out`. The block repeats 32 times, and the shape returns to `[rows,4096]` after each update.
+
+Hard readability rules
+
+- Use exactly 4 main panels: Running Stream, Attention Update, SwiGLU FFN Update, Residual Rule. Do not merge panels or add a fifth panel.
+- Keep all visible poster text between 120 and 180 words total, excluding the source strip.
+- Treat everything outside "Visible content to render", the TA answer box,
+  the trap strip, and the source strip as instructions only. Do not render
+  explanatory prompt prose.
+- Prefer arrows, plus nodes, shape tags, and side-by-side contrast over paragraphs.
+- Minimum readable text size: 24 px at 2400 x 1350. Title may be larger; source strip may be 18-20 px.
+- If content does not fit, delete secondary detail before shrinking text.
+- Delete in this order: code signatures, extra constants, kernel labels, repeated shape labels, extra arrows, source-strip entries.
+- Never use tiny text, dense tables, long code snippets, or more than one TA answer box.
+- Make `[rows,4096]` the repeated visual anchor. Show `[s,4096]` once as the assignment mental model.
+- Do not render Markdown backtick characters. Code terms may be plain text or monospace-styled, but no literal grave-accent marks.
+
+Visual style
+
+- Polished high-resolution technical study poster, 16:9, white background.
+- Clean vector-like diagram, crisp arrows, large shape labels, no visual clutter.
+- Color language: blue for residual stream `X`, purple for attention, orange for FFN/SwiGLU, red/pink for residual adds, green for the enclosing decoder block.
+- Use exactly two large plus nodes, one in Panel 2 for `X = X + attn_out`
+  and one in Panel 3 for `X = X + ffn_out`. Do not place plus nodes in
+  Panel 1 or Panel 4.
+- Show FFN expansion/contraction as a clear width change: `4096 -> 14336 -> 4096`.
+
+Visible content to render
+
+Render only these labels:
+
+Panel 1: Running Stream
+- X [rows,4096]
+- [s,4096] mental model
+- 32 layers
+Panel 1 must be a simple stack/loop overview only: X enters decoder blocks,
+X leaves with the same shape, and the stack repeats 32 layers. Inside the
+one-layer block, use two tiny unlabeled generic bars or no interior bars at
+all. Do not put plus nodes, equations,
+"Attention Update", "SwiGLU FFN Update", Q/K/V, RoPE, GQA, W_O, gate/up, H,
+down, attn_out, or ffn_out inside Panel 1; Panels 2 and 3 own those details.
+
+Panel 2: Attention Update
+- RMSNorm -> Q/K/V -> RoPE on Q,K; V no RoPE -> GQA -> W_O
+- attn_out [rows,4096]
+- X = X + attn_out
+- "Context returns to 4096."
+
+Panel 3: SwiGLU FFN Update
+- RMSNorm
+- gate, up [rows,14336]
+- H = SiLU(gate) * up
+- down -> ffn_out [rows,4096]
+- X = X + ffn_out
+- "Row-wise refinement."
+Panel 3 must show the second RMSNorm before `gate, up`. Do not draw raw `X`
+feeding directly into gate/up.
+
+Panel 4: Residual Rule
+- X [rows,4096] + update [rows,4096] -> X [rows,4096]
+- "No add after RoPE or before down."
+Panel 4 should be a compact rule card only. Render the residual rule as a
+single boxed text line: X [rows,4096] + update [rows,4096] -> X [rows,4096].
+Do not also render a separate "4096 + 4096 -> 4096" equation. Do not draw
+separate symbolic plus or equals signs, and do not draw the output as a second
+loose box under the equation.
+
+Small TA answer box
+
+Render one small answer script:
+
+"Say: Each layer adds two updates to the same running X. Attention mixes context, returns to 4096, and adds. Then a second RMSNorm feeds SwiGLU: expand each row to 14336, gate it, return to 4096, and add. Matching shapes make residuals valid."
+
+Small trap strip
+
+Render as a thin red strip:
+
+"Do not say: fused W_qkv; FFN mixes tokens; residual after RoPE; residual before down; final RMSNorm/lm_head inside block."
+
+Bottom source strip
+
+Render only these anchors, small but readable:
+
+docs/assignment/llm_part2.md | src/inference_layer.cu | kernel/residual.cu | kernel/swiglu.cu | src/model_weights.cpp
+
+Guardrail facts the image must obey but should not render unless listed
+
+- Assignment block order: `RMSNorm -> Q/K/V projections -> RoPE on Q,K -> Attention -> Output projection -> Residual -> RMSNorm -> FFN -> Residual`, repeated for `NUM_LAYERS = 32`.
+- Repo implementation loop is in `forward_step` in `src/inference_layer.cu`: `for (int layer = 0; layer < NUM_LAYERS; ++layer)`.
+- Repo code uses `rows = batch * q_seq`; the assignment mental model is `[s,4096]`.
+- Constants: `EMBEDDING_DIM = 4096`, `FFN_DIM = 14336`, `NUM_LAYERS = 32`, `RMS_NORM_EPSILON = 1e-5`.
+- Q, K, and V are separate projection matmuls using `W_Q`, `W_K`, and `W_V`; never show a fused `W_qkv`.
+- RoPE rotates Q and the newly written K rows only. V is not rotated.
+- Attention update: stitched attention output `O` is projected with `W_O` to `attn_out [rows,4096]`, then residual #1 applies `X = X + attn_out`.
+- Residual #1 happens only after the output projection returns the attention update to `[rows,4096]`.
+- FFN update uses the second RMSNorm weight, `post_attention_layernorm.weight`, distinct from `input_layernorm.weight`. This second RMSNorm happens after residual #1 and before `gate`/`up`.
+- FFN formulas: `gate = X_norm * W_gate^T`, `up = X_norm * W_up^T`, `H = SiLU(gate) * up`, `ffn_out = H * W_down^T`, then `X = X + ffn_out`.
+- `gate` and `up` have shape `[rows,14336]`; `ffn_out` returns to `[rows,4096]`.
+- `gpu_swiglu(d_gate, d_up, d_gate, rows * FFN_DIM)` computes `SiLU(gate) * up` and aliases output back into `d_gate` in this repo.
+- Residual calls use `gpu_residual_add(d_X, d_attn_out, rows * d)` and `gpu_residual_add(d_X, d_ffn, rows * d)`.
+- `kernel/residual.cu` implements elementwise `a[i] += b[i]`.
+- Assignment formulas use `X * W^T`. This repo transposes projection weights at load time in `src/model_weights.cpp`, so runtime matmul receives already-transposed `[in,out]` buffers such as `d_wgate [4096,14336]`, `d_wup [4096,14336]`, and `d_wdown [14336,4096]`.
+- Final RMSNorm happens once after all 32 decoder blocks, before the output layer. It is not part of this repeated block.
+- Repo-specific output-layer exception: `tie_word_embeddings=false`; logits use a separate `lm_head` weight. Do not render output-layer details in this image.
+
+Do-not-render rules
+
+- Do not render full source code, long function signatures, or a file-by-file checklist.
+- Do not render every TA question. Use the single answer script only.
+- Do not render final RMSNorm, `lm_head`, logits, argmax, token IDs, detokenization, sampling, tokenizer, or chat template.
+- Do not render KV-cache internals, cache length updates, or prefill/decode control flow.
+- Do not draw RoPE being applied to V.
+- Do not repeat the attention/FFN sub-block diagrams inside Panel 1.
+- Do not draw named attention/FFN internals, plus nodes, or residual equations
+  inside Panel 1.
+- Do not draw incomplete equations, loose plus/equals symbols, or dangling
+  output boxes in Panel 4.
+- Do not render both the short dimension equation and the full residual
+  equation in Panel 4; render only the full residual equation.
+- Do not render literal Markdown backticks in any visible label, TA script, trap strip, or source strip.
+- Do not render assignment math and runtime transposed-weight details as a double transpose.
+- Do not show FFN/SwiGLU connecting different token rows. Attention mixes across tokens; FFN is row-wise.
+- Do not show gate/up projections reading raw `X`; they read the second
+  RMSNorm output.
+- Do not place residual #1 before `W_O`; do not place residual #2 before `W_down`.
+- Do not use invented source labels or filenames.
+- Do not turn the image into a dense checklist. If a fact is only a guardrail, obey it silently.

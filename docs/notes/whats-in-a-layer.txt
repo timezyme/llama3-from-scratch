@@ -1,0 +1,223 @@
+# Step H1 — What's inside one decoder layer
+
+## The setup
+
+Llama 3 8B has 32 decoder layers stacked one after another. Think of each layer as a function:
+
+- **Input**: a grid of numbers, shape N × 4096. (N = number of tokens in the prompt. 4096 = numbers used to represent each token.)
+- **Output**: a grid of numbers, same shape (N × 4096).
+
+Layer 1's output becomes layer 2's input. Layer 2's output becomes layer 3's input. And so on, 32 times. The 32nd layer's output then goes to the final part of the pipeline (final RMSNorm → lm_head → argmax → detokenize).
+
+I'll call the input grid `X`. Each row of `X` is the 4096 numbers representing one token.
+
+## What's inside ONE layer: 9 operations in two groups
+
+Each layer runs 9 small operations in order, split into two groups:
+
+- **Group A — Attention sub-block (operations 1–6)**: each token "looks at" the earlier tokens and updates itself based on what it learned.
+- **Group B — Feed-forward sub-block / FFN (operations 7–9)**: each token's row gets transformed on its own. No token sees any other in this group.
+
+## A 3-part pattern that BOTH groups follow
+
+Before I list the 9 operations, let me explain a pattern. Both groups follow the same 3-part shape: **Rescale → Compute → Add back**. Here's what each part means:
+
+### Part 1 — Rescale (this is what an operation called RMSNorm does)
+
+Numbers in `X` tend to drift huge or tiny as they pass through 32 layers, which breaks the math. Before each group does its real work, it first rescales the numbers to a stable size.
+
+**RMSNorm** = Root Mean Square Normalization. Applied to each row of 4096 numbers independently:
+
+1. Square every number.
+2. Average those squared values.
+3. Take the square root → call it `rms`.
+4. Divide every number by `rms`.
+5. Multiply each number by a fixed per-column weight loaded from the model file.
+
+Result: a row with the same shape (4096 numbers), but rescaled.
+
+### Part 2 — Compute (different math for each group)
+
+After rescaling, the group does its actual work. For attention: "let each token look at earlier tokens." For FFN: "transform each row through a non-linear function." The output is a grid I'll call the **delta** — what the group thinks should change about `X`.
+
+### Part 3 — Add the delta back to X (called a "residual connection")
+
+This part trips people up, so let me be careful.
+
+The group's job is **not** to replace `X`. Its job is to *modify* `X`. The way we modify is:
+
+    X = X + delta
+
+Plain element-wise addition between two grids of the same shape (N × 4096). After this, `X` still contains its original information PLUS the group's contribution. The group "nudged" `X`, didn't overwrite it.
+
+This pattern is called a **residual connection**. It exists for two reasons:
+
+- The original information in `X` doesn't get lost across 32 layers.
+- Training is more stable when each group only has to compute a small delta.
+
+So the pattern, in both groups, is: **Rescale → Compute → Add back to X**. Now the 9 operations.
+
+---
+
+## Group A — Attention sub-block (operations 1–6)
+
+### Operation 1: input_layernorm — the Rescale step
+
+Run RMSNorm on `X`. Output: `X_norm1` (N × 4096). Set the original `X` aside — operation 6 needs it.
+
+### Operation 2: Q/K/V projection — start of the Compute step
+
+Multiply `X_norm1` by three different fixed weight matrices, producing three different "views" of the data:
+
+- **Q** ("query") — shape N × 4096
+- **K** ("key") — shape N × 1024
+- **V** ("value") — shape N × 1024
+
+Q, K, V are just `X_norm1` multiplied by three different weight matrices. The weights are fixed (loaded once from the model file). (Why K and V are smaller than Q: see H2.)
+
+### Operation 3: RoPE — Rotary Position Embedding
+
+Q and K don't yet know "where in the sequence" each token is. RoPE fixes that by rotating pairs of numbers within each row of Q (and each row of K). The rotation angle depends on the token's position. Angles come from a precomputed cos/sin table loaded once at startup.
+
+After RoPE: Q stays N × 4096, K stays N × 1024, but their numbers now encode position. V is left alone.
+
+### Operation 4: The attention computation itself
+
+For each token `i` (all N tokens computed in parallel on the GPU):
+
+1. Take token `i`'s Q row.
+2. Compare it (via dot product) against the K rows for tokens 1 through `i`. Each comparison produces one number — a **score**.
+3. Apply **softmax** to those scores. Softmax turns raw scores into **weights**: positive numbers that sum to 1.
+4. Take a weighted sum of the V rows for tokens 1 through `i` using those weights.
+5. The result is one 4096-number vector — token `i`'s "attention output."
+
+Stack all N tokens' outputs into a grid called `Attn` (N × 4096). (Per-head mechanics in H3.)
+
+### Operation 5: o_proj — finishes the Compute step
+
+Multiply `Attn` by `o_proj` (4096 × 4096). This blends the per-head outputs together. Output: `Attn_out` (N × 4096). This is the **delta** for sub-block A.
+
+### Operation 6: Residual add — the Add-back step
+
+Add the delta back to the original `X` we saved in operation 1:
+
+    X = X + Attn_out
+
+End of sub-block A. `X` now contains its original info plus attention's contribution.
+
+---
+
+## Group B — Feed-forward sub-block (operations 7–9)
+
+### Operation 7: post_attention_layernorm — the Rescale step
+
+Run RMSNorm again, this time with a different set of per-column weights (loaded from a different spot in the model file). Apply to the just-updated `X`. Output: `X_norm2` (N × 4096). Set `X` aside — operation 9 needs it.
+
+### Operation 8: FFN with SwiGLU — the Compute step
+
+The FFN transforms each row independently. The shape goes 4096 → 14,336 → 4096 (expand, then contract):
+
+1. Multiply `X_norm2` by `gate_proj` (4096 × 14,336) → `Gate` (N × 14,336).
+2. Multiply `X_norm2` by `up_proj` (4096 × 14,336) → `Up` (N × 14,336).
+3. **SwiGLU activation** (element-wise on Gate and Up): every element of Gate becomes `SiLU(Gate) × Up`, where `SiLU(x) = x × sigmoid(x)` is a smooth non-linear function. This is the only non-linearity in the entire layer.
+4. Multiply that result by `down_proj` (14,336 × 4096) → `FFN_out` (N × 4096).
+
+`FFN_out` is sub-block B's **delta**.
+
+### Operation 9: Residual add
+
+    X = X + FFN_out
+
+End of sub-block B. End of one full layer. `X` is still N × 4096, ready for the next layer.
+
+**The KV cache only touches operation 2** — the K and V projections.
+
+---
+
+# Step H2 — Q, K, V dimensions and GQA
+
+In operation 2 above, three weight matrices are multiplied by `X_norm1` to produce:
+
+- **Q** ("query") — shape N × 4096
+- **K** ("key") — shape N × 1024
+- **V** ("value") — shape N × 1024
+
+## What's a "head"?
+
+Each row has a fixed number of columns (4096 for Q, 1024 for K and V). Internally, that row is conceptually chopped into smaller chunks called **heads**. Each head specializes — it's like having multiple parallel attention mechanisms, each looking at the data from a different angle.
+
+For Llama 3 8B (from `config.h:17-19`):
+
+- **Q**: 32 heads × 128 numbers per head = 4096 (so Q has 32 heads).
+- **K**: 8 heads × 128 numbers per head = 1024 (so K has 8 heads).
+- **V**: 8 heads × 128 numbers per head = 1024 (so V has 8 heads).
+
+## Why are K and V narrower than Q? GQA.
+
+**GQA** = Grouped Query Attention. Instead of giving each Q head its own dedicated K head and V head (which would require 32 K heads and 32 V heads, total 4096 width each), Llama 3 lets 4 Q heads share the same K head and V head. So 32 Q heads ÷ 4 = 8 K (and V) heads.
+
+Why do this? It saves memory, compute, and — relevant here — shrinks the KV cache by 4× versus the non-GQA design.
+
+---
+
+# Step H3 — How attention uses Q, K, V
+
+For each token `i` (all N tokens in parallel):
+
+1. Take token `i`'s Q row (4096 numbers, 32 heads of 128).
+2. Compare against K rows for tokens 1 through `i` (each row 1024 numbers, 8 heads of 128). Comparison happens per-head: each Q head dot-products against its assigned K head. (Under GQA, 4 Q heads share each K head.) Each comparison gives one number — a score.
+3. Apply scaling and **softmax** → weights (positive numbers that sum to 1 across positions).
+4. Take a weighted sum of the V rows for tokens 1 through `i` using those weights.
+5. Stitch the per-head outputs back into a single 4096-number vector — token `i`'s attention output.
+
+**The crucial fact for the cache**: computing attention for token `i` needs K and V for every token from 1 through `i`, but only Q for token `i` itself. This asymmetry — needing all past K/V but only the current Q — is exactly what the cache exploits.
+
+---
+
+# Step H4 — Why the naive loop wastes work
+
+Suppose your prompt is 5 tokens. You generate one token at a time.
+
+**Iteration 1**: input is 5 tokens. Inside each layer, compute K (5 × 1024) and V (5 × 1024). Get the next token. Now you have 6 tokens.
+
+**Iteration 2**: input is 6 tokens. Inside each layer, compute K (6 × 1024) and V (6 × 1024).
+
+Here's the problem. The K and V values for tokens 1–5 in iteration 2 are bit-for-bit identical to iteration 1: same input row, same fixed weights, same matmul, same output. We just redid 5 tokens of K/V math for zero new information.
+
+By iteration 100, we'd be redoing 99 tokens of K/V math every step. That's the waste the cache fixes.
+
+---
+
+# Step H5 — What the KV cache IS (just storage)
+
+Two pre-allocated GPU buffers per layer — 32 layers × 2 = 64 buffers total:
+
+- **K buffer**: shape `max_seq_len × 1024` per layer.
+- **V buffer**: shape `max_seq_len × 1024` per layer.
+
+(`max_seq_len` is set at startup, big enough to fit the longest sequence we'll generate.)
+
+These buffers are just empty grids of GPU memory. Allocated once, reused for the whole generation. The cache lets us write each token's K and V values once, then read them back forever.
+
+---
+
+# Step H6 — How the loop USES the cache
+
+The first iteration (called the **prefill**) processes all N prompt tokens at once and fills the cache with their K and V values for every layer.
+
+After prefill, every later iteration processes only one new token. Mapping back to H1's 9 operations:
+
+For each of the 32 layers in order:
+
+1. **Input shrinks**: the new token's row is shape 1 × 4096 (instead of N × 4096). Layer 0 receives the new token's embedding; each later layer receives the previous layer's 1 × 4096 output.
+2. **Operation 1 (input_layernorm)**: RMSNorm on 1 row.
+3. **Operation 2 (Q/K/V projection)**: produces Q (1 × 4096), K (1 × 1024), V (1 × 1024) for the new token only. The K and V matmuls write directly into the next empty cache slot for this layer — no separate "append" step.
+4. **Operation 3 (RoPE)**: applied to the new Q and the new K, using position-N's RoPE angles.
+5. **Operation 4 (attention)**: reads all cached K (N rows × 1024) and V (N rows × 1024) for this layer, plus the new Q (1 × 4096). Output: 1 × 4096.
+6. **Operations 5–9** (o_proj, residual, post_attention_layernorm, FFN, residual): all run on a 1-row matrix.
+
+After all 32 layers complete: `cache.advance(1)` bumps the cache's logical length by 1. Then the rest of the pipeline runs (final RMSNorm → lm_head → argmax → detokenize), all on a 1-row input.
+
+Loop until max-tokens limit, or the model picks an end-of-sequence token.
+
+**Why this is so much faster**: every matmul inside every layer now operates on a 1-row input instead of N rows. No re-computation for past tokens — their K and V are already in the cache.

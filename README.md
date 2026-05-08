@@ -10,7 +10,7 @@ The pipeline runs all 32 decoder layers: BPE tokenization, embedding lookup, RMS
 - **Multi-token path uses BF16** for resident weights so all ~14.5 GB of Llama 3 8B can stay on L4's 24 GB VRAM. FP32 residency would need 32 GB. Per the discussion-board policy on BF16, please apply the relaxed-epsilon allowance to any internal M2-3 tests whose tolerances were written for FP32 reference values.
 - **Conclusive end-to-end test (`docs/assignment/llm_part2.md` §3.1 Step 6)**: `./bin/llm --max-tokens 8 "What is the capital of California?"` produces `"The capital of California is Sacramento."` (token-by-token argmax decode + EOT). Verified on L4 in this branch.
 - **Live demo:** `./scripts/demo-start.sh` brings up the L4, SSHes in, and drops into an interactive REPL (`./bin/llm --interactive --max-tokens 32`). Resident BF16 weights load once (~3 min); each subsequent prompt answers in ~3s. After the demo, `./scripts/demo-stop.sh` stops the VM.
-- **Extensions shipped**: KV cache + resident weights, and B>1 batched generation. Both ship with internal parity tests; see `tests/test_m2m3.cpp` (`batched_b2_distinct_parity`, etc.).
+- **Extensions shipped**: KV cache + resident weights, and B>1 batched generation. Both ship with internal parity tests; see `tests/test_m2m3_kv_batch.cpp` (`batched_b2_distinct_parity`, etc.).
 
 ## Quick start
 
@@ -82,7 +82,7 @@ After capturing the custom image, future `provision_l4.sh` runs boot in ~60s wit
 
 ## Test results
 
-All 7 M1 tests and 30 M2-3 tests pass on a GCP L4 (g2-standard-4, sm_89). CLI inference produces correct tokens validated against PyTorch.
+All 7 M1 tests and 38 M2-3 tests pass on a GCP L4 (g2-standard-4, sm_89). CLI inference produces correct tokens validated against PyTorch.
 
 ### Milestone 1 (tokenizer, embeddings, matmul)
 
@@ -98,7 +98,7 @@ All 7 M1 tests and 30 M2-3 tests pass on a GCP L4 (g2-standard-4, sm_89). CLI in
 
 ### Milestones 2-3 (CUDA kernels, full inference)
 
-30 tests covering RMSNorm, RoPE, attention (scale, causal mask, softmax, GQA), SwiGLU, residual add, BF16-weight matmul parity, B>1 batched parity, KV-cache bounds, single-layer forward pass, and full 32-layer inference. Run with:
+38 tests covering RMSNorm, RoPE, attention (scale, causal mask, softmax, GQA), SwiGLU, residual add, BF16-weight matmul parity, B>1 batched parity, KV-cache bounds, single-layer forward pass, and full 32-layer inference. Run with:
 
 ```bash
 ./bin/tests_m2m3 --list   # list all test names
@@ -128,6 +128,7 @@ include/
   loader.h               # LlamaDumpLoader (binary dump reader)
   milifloat.h            # BF16/FP16 → FP32 converters
   model_weights.h        # Per-layer and global weight management
+  device_weights.h       # GPU-resident weight manager (BF16 device buffers)
   inference.h            # Forward-pass entry points
   kv_cache.h             # Device-side per-layer K/V buffers (multi-token decode)
   instrument.h           # Header-only Stopwatch + probe_vram telemetry
@@ -136,7 +137,12 @@ src/
   tokenizer_bpe.cpp      # BPE tokenizer (encode/decode with special tokens)
   loader.cpp             # Weight loader (280-byte header + BF16/FP16/FP32 payload)
   model_weights.cpp      # Weight loading with transpose-at-load
-  inference.cu           # 32-layer forward pass with chat template
+  device_weights.cu      # GPU-resident BF16 weight upload/free
+  inference.cu           # Public API facade (forward_pass entry points)
+  inference_internal.h   # Cross-TU private declarations for inference_*.cu
+  inference_chat.cu      # Chat template formatting
+  inference_layer.cu     # Single decoder block (attention + FFN)
+  inference_loop.cu      # Autoregressive decode orchestrator (single / KV / batched)
   kv_cache.cu            # cudaMalloc/cudaFree per-layer K/V buffers
 kernel/
   kernels.cuh            # Host-callable kernel entry points
@@ -151,7 +157,14 @@ tests/
   test.cpp               # M1 test harness (7 tests, read-only)
   test_api.h             # TestAPI interface (read-only)
   test_api.cpp           # TestAPI implementation (tokenize, embed, matmul)
-  test_m2m3.cpp          # M2-3 test harness (CUDA required)
+  test_m2m3_main.cpp     # M2-3 test driver (dispatches by name)
+  test_m2m3_helpers.h    # Shared helpers and registry type
+  test_m2m3_helpers.cpp  # Tolerance comparisons and fixture I/O
+  test_m2m3_matmul.cpp   # Phase 0: matmul/loader parity tests
+  test_m2m3_rmsnorm_proj.cpp  # Phase 1: RMSNorm + Q/K/V projections
+  test_m2m3_rope_attn.cpp     # Phase 2: RoPE, GQA, causal mask, softmax
+  test_m2m3_decoder_full.cpp  # Phase 3-4: residual, SwiGLU, full decoder block
+  test_m2m3_kv_batch.cpp      # Phase 5: final norm, lm_head, KV cache, B>1 batching
 tools/
   llama3_downloader.py   # Download weights from Hugging Face
   dumper.py              # Safetensors → binary dump (280-byte header + payload)

@@ -108,6 +108,7 @@ __global__ void rope_kernel(float *__restrict__ x,
     int total = seq_len * num_heads * half_hd;
     if (idx >= total) return;
 
+    // How the kernel works:
     // Unpack the flat thread index into (row, head, pair_idx). The
     // `row % q_seq` step is what resets the position counter at each
     // batch-slot boundary (see Section 2 banner above for why).
@@ -115,6 +116,7 @@ __global__ void rope_kernel(float *__restrict__ x,
     int tmp = idx / half_hd;
     int head = tmp % num_heads;
     int row = tmp / num_heads;
+    // computes position
     int pos = row % q_seq;
 
     int row_stride = num_heads * head_dim;
@@ -123,7 +125,7 @@ __global__ void rope_kernel(float *__restrict__ x,
     int i_first = base + pair_idx;             // q[i]
     int i_second = base + pair_idx + half_hd;  // q[i + h_d/2] — rotate-half pair
 
-    // cos_table/sin_table are laid out [position, pair_index].
+    // Looks up precomputed cos/sin from the table
     int cs_idx = pos * half_hd + pair_idx;
     float c = cos_table[cs_idx];
     float s = sin_table[cs_idx];
@@ -131,7 +133,7 @@ __global__ void rope_kernel(float *__restrict__ x,
     float q_first = x[i_first];
     float q_second = x[i_second];
 
-    // 2x2 rotation: [c -s; s c] * [q_first; q_second].
+    // applies the 2D rotation
     x[i_first]  = q_first * c - q_second * s;
     x[i_second] = q_first * s + q_second * c;
 }

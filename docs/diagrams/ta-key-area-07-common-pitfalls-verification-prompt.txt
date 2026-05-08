@@ -1,0 +1,141 @@
+Title
+Key Area 7: Common Pitfalls and How to Verify Them
+
+Knowledge-transfer goal
+Create a polished 16:9 educational technical infographic for a CS265 TA-prep explanation. The viewer should understand the main idea in 10 seconds and be able to explain it out loud in under 60 seconds.
+
+The image should teach this, not list everything: most Part 2 mistakes come from mixing up attention geometry, checkpoint/runtime tensor facts, and required-vs-extension boundaries.
+
+Core story
+Common pitfalls are not isolated trivia. They cluster around three places where a correct implementation can quietly become wrong: attention math/layout, weight/logit facts, and grading boundaries.
+
+This repo avoids or exposes those mistakes with stable softmax, correct causal-mask gating, Llama 3 RoPE, GQA head mapping, transposed checkpoint weights, a separate `lm_head`, last-token logits, and reference/CUDA checks.
+
+The student's safest TA answer is: explain the required B=1 one-token path first: one prompt, all 32 decoder layers, one output token. Then label KV cache, resident BF16 weights, and batching as repo extensions.
+
+Hard readability rules
+- Render a high-resolution 16:9 canvas, suitable for 2400 x 1350 or larger.
+- Visible text across the whole infographic must stay around 120-180 words total, including title, panel labels, TA box, trap strip, and source strip.
+- Use 4 main panels maximum, plus one small TA answer box, one small trap strip, and one bottom source strip.
+- If text becomes too small, delete secondary detail before shrinking text. Never solve overcrowding with tiny type.
+- Each main panel gets one short title, one central visual, and at most 3 callouts.
+- Prefer arrows, matrices, head-group diagrams, red/green contrasts, and shape labels over paragraphs.
+- Keep repo facts as guardrails unless they are explicitly listed under "Visible content to render."
+- File anchors may be tiny but must remain legible. Do not render long paths if short anchors are enough.
+
+Visual style
+- White background, clean study-poster layout, strong hierarchy.
+- Use red for wrong/misconception labels, green for correct behavior, blue for verification/source anchors, and purple for attention/RoPE geometry.
+- Use simple diagram shapes: arrows, matrix blocks, head-group brackets, small code/file labels, and compact contrast strips.
+- Make the main story readable left-to-right:
+  1. Required path vs extras
+  2. Attention geometry
+  3. Weight/logit shape traps
+  4. Verification boundary
+- Avoid decorative clutter. The poster should feel like a TA whiteboard condensed into one page.
+
+Visible content to render
+Render this visible text and diagram structure. Keep wording close, but prefer legibility over exact line breaks.
+
+Main title:
+Key Area 7: Common Pitfalls and How to Verify Them
+
+Subtitle:
+Most bugs are shape, mask, or requirement-boundary mistakes.
+
+Panel 1 title:
+Required path first
+
+Panel 1 visual/text:
+B=1 prompt -> 32-layer decoder stack -> last hidden row -> separate lm_head -> argmax vs reference
+Extras: KV cache, resident BF16, equal-length batching
+Panel 1 must explicitly show "32-layer decoder stack" or "32 layers". Do not
+write "one layer" anywhere in Panel 1. "One token" means one generated token,
+not one decoder layer.
+
+Panel 2 title:
+Attention geometry
+
+Panel 2 visual/text:
+Scale -> causal mask -> stable softmax
+RoPE: Q + new K only, base 500000, rotate-half
+GQA: 32 Q heads -> 8 KV heads, 4:1
+
+Panel 3 title:
+Shape traps
+
+Panel 3 visual/text:
+Checkpoint [out,in] -> transpose once -> runtime [in,out]
+K/V are 8 heads, not 32
+Project only the last row
+
+Panel 4 title:
+Verification boundary
+
+Panel 4 visual/text:
+Required: match reference argmax
+Operator checks explain drift
+CUDA checks belong on the L4 lane
+
+Small TA answer box
+Label:
+TA answer script
+
+Visible script:
+The required deliverable is B=1 one-token inference through all 32 layers. The code normalizes, projects transposed weights, rotates Q/new K, runs GQA with mask + stable softmax, uses final RMSNorm, then the separate lm_head on the last row. Cache/resident/batch are extensions.
+
+Small trap strip
+Label:
+Do not say
+
+Visible trap text:
+lm_head is tied. V is rotated. Decode re-rotates old K. Mixed-length batches work. Extras are required.
+
+Bottom source strip
+Visible source anchors only:
+docs/assignment/llm_part2.md | src/inference_layer.cu | kernel/attention.cu | kernel/rope.cu | src/model_weights.cpp | tools/verify_reference.py | tests/test_m2m3_*.cpp
+
+Guardrail facts the image must obey but should not render unless listed
+- Part 2 base requirement is the B=1 one-token forward/generation path, exposed by `generate_next_token(...)` and `generate_next_token_impl(...)`.
+- B=1 one-token inference still runs the full 32-layer decoder stack. Do not confuse "one generated token" with "one decoder layer".
+- KV cache, resident BF16 weights, multi-token generation, batching, and extension parity tests are repo extensions. Do not imply they are mandatory professor-test requirements.
+- CUDA-specific Part 2 verification belongs on a CUDA machine, specifically the L4 lane for this repo. Do not present local CPU-only macOS limits as correctness failures or milestone blockers.
+- The official requirement is to verify the final argmax token against `reference.py`; `tools/verify_reference.py` compares operator outputs and final argmax against the reference path.
+- Split `tests/test_m2m3_*.cpp` files include CUDA fixture checks for RMSNorm, Q/K/V, RoPE, attention, residuals, SwiGLU, decoder block, final RMSNorm, and full forward token generation.
+- Stable softmax subtracts the per-row max before `exp`. The preserved formula is `exp(S[p,q] - row_max) / sum_k exp(S[p,k] - row_max)`.
+- The causal mask writes `-1e6` for future positions `q > p` in square prefill. In this repo, `run_attention_heads` applies the square mask only when `q_seq == kv_seq && q_seq > 1`.
+- Cached decode has `q_seq=1` and `kv_seq=len_before+1`; the new query can attend to cached positions up to itself, so there are no future cached positions in that slice.
+- RoPE uses Llama 3 base `500000`, not `10000`.
+- RoPE uses rotate-half pairing: index `i` pairs with `i + HEAD_DIM/2`; for `HEAD_DIM=128`, index `0` pairs with `64`.
+- RoPE applies to Q and K only. V is cached and attended to but never rotated.
+- In cached decode, only the newly written K rows are rotated. Old cached K rows were already rotated when first written.
+- RMSNorm is not LayerNorm: no mean subtraction, no bias. It normalizes by root mean square and applies gamma with epsilon inside the square root.
+- Each decoder layer has two distinct RMSNorm gammas: `input_layernorm.weight` before attention and `post_attention_layernorm.weight` before FFN. The final norm uses `model.norm.weight`.
+- Checkpoint projection weights are `[out,in]`; runtime matmul wants `[in,out]`; this repo transposes once at load time.
+- The assignment text says `lm_head` is shared with the embedding table, but this repo's checkpoint has `tie_word_embeddings=false`.
+- For this repo, logits must use `global/lm_head_weight.bin`, not the embedding table.
+- `lm_head` is a separate `[VOCAB_SIZE, EMBEDDING_DIM]` tensor. With repo constants, that is `[128256,4096]`.
+- Final RMSNorm is applied to all current rows, then only the last hidden row per batch slot is copied for logits.
+- `compute_lm_head_logits` is a CPU host loop in this repo, not a GPU kernel.
+- Packed Q is `[s,4096] = [s,32*128]`.
+- Packed K and V are `[s,1024] = [s,8*128]`.
+- GQA maps query head `hi` to KV group `kvg = hi / 4`; four Q heads share one K/V head.
+- The repo reuses one scratch score matrix `scratch.d_S [q_seq,kv_seq]` inside a per-head loop. Do not depict 32 score matrices allocated at once as the implementation.
+- Batched resident generation requires equal tokenized prompt lengths; `validate_equal_lengths(...)` rejects mixed-length batches.
+- Exact constants to preserve if shown: `500000`, `1e-5`, `128009`, `128256`, `4096`, `1024`, `14336`, `32`, `8`, `4`, `128`, `-1e6`.
+- Source anchors for factual grounding include `docs/assignment/llm_part2.md`, `reference.py`, `tools/verify_reference.py`, split `tests/test_m2m3_*.cpp` files, `assets/llama3/config.json`, `docs/learnings.md`, `config.h`, `kernel/rmsnorm.cu`, `kernel/rope.cu`, `kernel/attention.cu`, `kernel/swiglu.cu`, `kernel/residual.cu`, `src/inference_layer.cu`, `src/inference_loop.cu`, `src/model_weights.cpp`, `include/model_weights.h`, and `include/inference.h`.
+
+Do-not-render rules
+- Do not render the guardrail list as a checklist.
+- Do not render 11 pitfall cards.
+- Do not render long code snippets, mini paragraphs, or a wall of file paths.
+- Do not render a TA question list. Use only the short TA answer script.
+- Do not render every exact constant; show only constants that clarify the main story.
+- Do not show the assignment's tied-embedding statement as true for this repo.
+- Do not draw V as rotated.
+- Do not draw old cached K rows being rotated again.
+- Do not draw mixed-length batched generation as supported.
+- Do not show KV cache, resident BF16 weights, batching, or extension parity tests as mandatory Part 2 requirements.
+- Do not label the required decoder as "one layer". It is one generated token through 32 layers.
+- Do not present local CPU-only macOS verification limits as repo defects.
+- Do not shrink text below comfortable readability. Remove details first.

@@ -1,0 +1,97 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart TB
+
+    %% ── Legend ──────────────────────────────────────────────
+    subgraph Legend["Legend"]
+        direction LR
+        L1["Completed"]:::done
+        L2["Current step"]:::current
+        L3["TA-scrutiny hotspot"]:::hot
+        L4(["Cross-cutting kernel / state"]):::kernel
+    end
+
+    %% ── CLI Dispatch ────────────────────────────────────────
+    subgraph CLI["CLI Dispatch  (main.cpp)"]
+        S1["S1: CLI entry & path dispatch\nParse argv, pick 1 of 4 paths\nmain.cpp:50-91"]:::done
+
+        P1["Path 1: single token\nFP32 stream, no KV cache\nmain.cpp:203-209"]
+        P2["Path 2: multi-token\nBF16 resident + KV cache\nmain.cpp:211-219"]
+        P3["Path 3: batched B>1\nLockstep decode\nmain.cpp:223-237"]
+        P4["Path 4: interactive REPL\nResident weights, stdin loop\nmain.cpp:95-142"]
+
+        S1 -->|"max_tokens=1\n1 prompt"| P1
+        S1 -->|"max_tokens>1\n1 prompt"| P2
+        S1 -->|"max_tokens>=1\nN prompts"| P3
+        S1 -->|"--interactive"| P4
+    end
+
+    %% ── Tokenization ────────────────────────────────────────
+    subgraph Tokenization["Tokenization"]
+        S2["S2: Chat template\napply_chat_template\nsrc/inference_chat.cu:38-55"]:::done
+        S3["S3: BPE encode\nGreedy lowest-rank merge\nsrc/tokenizer_bpe.cpp:251-307"]:::done
+    end
+
+    %% ── Weights ─────────────────────────────────────────────
+    subgraph Weights["Weight Loading"]
+        S4["S4: Dump format & loader\n280-byte header, BF16 decode\nsrc/loader.cpp:217-263"]:::done
+        S5["S5: ModelWeights\nTranspose-at-load (W^T)\nsrc/model_weights.cpp:111-191"]:::done
+    end
+
+    %% ── Forward Pass ────────────────────────────────────────
+    subgraph Forward["Forward Pass  (per token)"]
+        S6["S6: Embedding lookup\ntoken ID -> float[4096]\nsrc/model_weights.cpp:59-61"]:::done
+
+        subgraph Decoder["Decoder Block x32"]
+            S8["S8: RMSNorm #1\nRow-wise norm * gamma\nkernel/rmsnorm.cu:96-147"]:::hot
+            S9["S9: Q/K/V projections\nX_norm @ W^T via matmul\nsrc/inference_layer.cu:306-348"]:::done
+            S10["S10: RoPE\nRotate pairs (i, i+hd/2)\nkernel/rope.cu:101-137"]:::hot
+            S11["S11: GQA attention\nScaled dot-product + softmax\nkernel/attention.cu:109-207"]:::hot
+            S12["S12: O proj + residual #1\nConcat heads, project, add\nsrc/inference_layer.cu:386-393"]:::done
+            S13["S13: RMSNorm #2 + SwiGLU FFN\ngate/up/down + residual #2\nsrc/inference_layer.cu:399-427"]:::done
+
+            S8 --> S9 --> S10 --> S11 --> S12 --> S13
+            S13 -.->|"layer < 31:\nnext layer"| S8
+        end
+
+        S14["S14: 32-layer loop\nPer-layer weights\nsrc/inference_layer.cu:261-438"]:::done
+        S15["S15: Final RMSNorm\n+ last-token + lm_head\nsrc/inference_layer.cu:444-461"]:::hot
+
+        S6 --> S8
+        S13 --> S14
+        S14 --> S15
+    end
+
+    %% ── Output ──────────────────────────────────────────────
+    subgraph Output["Output"]
+        S16["S16: Argmax + decode\nToken ID -> text\nsrc/inference_loop.cu:179-180"]:::done
+    end
+
+    %% ── Cross-cutting nodes ─────────────────────────────────
+    S7(["S7: Matmul kernel\nTiled GEMM, shared mem\nkernel/matmul.cu:157-341"]):::hot
+    S17(["S17: KV cache\nPer-layer K/V buffers\nsrc/kv_cache.cu:39-58"]):::kernel
+    S18(["S18: B>1 batching\nLockstep multi-prompt\nsrc/inference_loop.cu:116-234"]):::kernel
+
+    %% ── Main flow edges ─────────────────────────────────────
+    P1 & P2 & P3 & P4 --> S2
+    S2 --> S3
+    S3 --> S6
+    S4 -.->|"loads into"| S5
+    S5 -.->|"supplies"| S6
+    S5 -.->|"supplies"| S9
+    S15 --> S16
+
+    %% ── Cross-cutting edges ─────────────────────────────────
+    S7 -.->|"used by"| S9
+    S7 -.->|"used by"| S15
+    S7 -.->|"used by"| S13
+    S17 -.->|"caches K/V\nfor decode"| S11
+    S18 -.->|"parallelizes"| S14
+
+    %% ── Autoregressive back-edge ────────────────────────────
+    S16 -.->|"feed new token\nautoregressive\ndecode loop"| S2
+
+    %% ── Class definitions ───────────────────────────────────
+    classDef done fill:#c8e6c9,stroke:#388e3c,stroke-width:2px,color:#1b5e20
+    classDef current fill:#fff9c4,stroke:#f9a825,stroke-width:3px,color:#000
+    classDef hot fill:#fff,stroke:#d32f2f,stroke-width:3px,color:#000
+    classDef kernel fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000,rx:20,ry:20

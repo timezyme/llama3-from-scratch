@@ -1,0 +1,172 @@
+Create a high-resolution educational infographic for CS265 TA prep.
+
+This is Key Area #8: Performance, KV Cache, and Optional Extensions.
+
+Knowledge-transfer goal:
+The viewer should understand the core story in 10 seconds and be able to
+explain it out loud in under 60 seconds. Prioritize readability over coverage.
+
+Core story:
+KV cache and resident BF16 weights solve two different performance problems.
+KV cache reuses old K/V projections during multi-token decode. Resident BF16
+weights avoid repeatedly moving layer weights from CPU/host storage to GPU.
+In this repo, the practical fast multi-token path uses both. `forward_step`
+returns a hidden vector; `lm_head + argmax` turns that hidden vector into the
+next token.
+
+Hard readability rules:
+- Output 16:9, 3840 x 2160 or larger.
+- Maximum 4 main panels plus one small source strip.
+- Maximum 150 visible words total, excluding tiny source labels.
+- Minimum body text must be readable at 100% zoom.
+- Prefer arrows, icons, grids, and short labels over prose.
+- If space is tight, remove secondary labels before shrinking text.
+- Do not render long file paths inside main panels.
+- Do not include dense tables, code blocks, or paragraphs.
+
+Visual style:
+- White background, crisp dark text, clean technical study-poster layout.
+- Green = KV cache / GPU reuse.
+- Purple = attention score growth.
+- Blue = host/controller and transfer.
+- Orange = generated tokens.
+- Red = traps / wrong explanations.
+- For host/controller, draw a plain blue rounded rectangle labelled "Host",
+  not a CPU chip. Do not use CPU chip icons anywhere in the main panels.
+
+Title:
+Key Area 8: Performance, KV Cache, and Optional Extensions
+
+Subtitle:
+Cache old K/V. Keep weights resident. Do not confuse the two.
+
+Visible content to render:
+
+Panel 1: Required vs Extra
+Purpose: make the grading boundary obvious.
+Render:
+- Required: one token through 32 layers
+- Extra: KV cache
+- Repo perf extra: resident BF16 weights
+- Fast multi-token
+- cache + resident weights
+Use those last two lines as a compact two-line callout, not one long wrapped
+equation.
+
+Panel 2: Prefill Then Decode
+Purpose: show the time flow.
+Render a left-to-right flow:
+- Host
+- Prefill `[s,4096]`
+- GPU `forward_step(s)`
+- fill K/V cache
+- Decode `[1,4096]`
+- GPU `forward_step(1)`
+- append K/V
+- `lm_head + argmax`
+- next token
+Draw the Host as a simple labelled box. Draw `forward_step` boxes as GPU work.
+Do not draw a CPU chip in this panel.
+
+Panel 3: What KV Cache Saves
+Purpose: teach the key mental model.
+Render a clear before/after:
+
+Without cache:
+- reprocess growing prefix
+- `s0+1 -> s0+2 -> s0+T`
+
+With cache:
+- reuse old K/V
+- still attends to history
+- score `[1,kv_seq]`
+
+Panel 4: Why Resident Weights Matter
+Purpose: teach this repo's performance twist.
+Render two lanes:
+
+Streaming path:
+- Host loads weights
+- upload to GPU
+- GPU compute
+- repeat
+
+Resident path:
+- upload BF16 once
+- keep in VRAM
+- reuse weights
+- same decoder math
+- less transfer
+Draw the streaming lane as Host -> GPU, with the "GPU compute" label attached
+to the GPU side. Do not show the host/CPU doing compute.
+
+Small TA answer box:
+Render exactly this short script:
+"Part 2 needs one correct token. KV cache reuses old K/V but still attends.
+This repo's fast multi-token path pairs cache with resident BF16 weights."
+
+Small red trap strip:
+Render each trap with a red X icon. These are wrong explanations, not facts:
+- KV cache is required
+- Cache skips old tokens
+- Cache alone fixes transfers
+- forward_step emits token directly
+- 32 score matrices at once
+
+Bottom source strip:
+Use only these anchors:
+- `docs/assignment/llm_part2.md`
+- `include/kv_cache.h`
+- `src/inference_loop.cu`
+- `src/inference_layer.cu`
+- `src/device_weights.cu`
+- `main.cpp`
+
+Guardrail facts the image must obey, but should not render unless listed above:
+- Part 2 does not require batching or KV caching.
+- Assignment bonus asks about no-cache generation reprocessing
+  `s0+1`, `s0+2`, ..., `s0+T`.
+- Assignment bonus asks about attention score memory growing as `[s,s]`.
+- `KVCache` stores K and V per layer as
+  `[batch, max_len, NUM_KV_HEADS * HEAD_DIM]`.
+- `S_MAX = 1024`, `NUM_LAYERS = 32`, `NUM_KV_HEADS = 8`,
+  `HEAD_DIM = 128`, `kv_dim = 1024`, `EMBEDDING_DIM = 4096`.
+- B=1 KV cache size is 256 MiB:
+  `32 * 1024 * 1024 floats * 4 bytes * 2`.
+- Prefill calls `forward_step` with `q_seq = prompt_len`.
+- Decode calls `forward_step` with `q_seq = 1`.
+- `forward_step` returns the final-RMSNormed hidden state for the last token.
+- The token is produced after `lm_head` projection and greedy argmax.
+- `kv_seq = cache.len() + q_seq`.
+- K/V projection matmuls append new rows into the cache.
+- `cache.advance(q_seq)` happens after all 32 layers finish.
+- Attention still reads cached K/V over the valid prefix.
+- The repo reuses one `AttentionScratch::d_S [q_seq,kv_seq]`; it does not
+  allocate 32 score matrices at once.
+- The one-token path may allocate `KVCache` for code reuse, but it has no
+  decode loop and does not require KV caching for the milestone.
+- `main.cpp` selects:
+  - `max_tokens == 1` -> `generate_next_token`
+  - `max_tokens > 1` -> `generate_tokens_resident`
+  - multiple prompts -> resident batched decode with equal tokenized lengths
+- `DeviceModelWeights` keeps per-layer BF16 weights resident in VRAM.
+- Host `ModelWeights` still owns embeddings, final norm, and `lm_head`.
+- Host/controller orchestration is not the same as CPU decoder compute; the
+  decoder block work in `forward_step` is GPU/CUDA work.
+- If a host icon is needed, use a generic "Host" rectangle, not a CPU chip.
+- Performance claims should be tied to profiling/timers, not guessed.
+
+Do-not-render rules:
+- Do not claim KV cache is required by Part 2.
+- Do not claim KV cache avoids attention over old tokens.
+- Do not claim KV cache alone makes the old streaming path fast.
+- Do not claim resident BF16 changes model math.
+- Do not show mixed-length batching as supported.
+- Do not show the repo allocating 32 attention score matrices at once.
+- Do not draw the multi-token CLI path as non-resident.
+- Do not draw `forward_step(1)` directly emitting a token; show
+  `lm_head + argmax` after it.
+- Do not imply CPU performs the decoder compute.
+- Do not draw CPU chip icons in the four main panels.
+- Do not wrap "Fast multi-token = cache + resident weights" into a cramped
+  multi-line equation; use the compact two-line callout instead.

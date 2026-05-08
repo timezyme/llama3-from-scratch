@@ -1,0 +1,108 @@
+Title
+Key Area 6: Output Layer and Greedy Token Generation
+
+Knowledge-transfer goal
+Create a high-resolution 16:9 educational infographic for CS265 TA prep. The viewer should understand the main idea in 10 seconds: after the decoder stack, this repo uses only the last hidden vector to choose one next token. In under 60 seconds, the viewer should be able to explain the GPU-to-CPU handoff, CPU `lm_head` logits, greedy argmax, stop behavior, and detokenization.
+
+Core story
+After all 32 decoder blocks, the model applies final RMSNorm to the hidden states. For next-token generation, only the last position matters, so the repo copies only that last hidden vector back to CPU. CPU host code scores every vocabulary token with a separate, untied `lm_head`, then greedy argmax chooses one token ID. Multi-token generation repeats this with the KV cache until the token limit or `EOT_ID`; `decode_token(id)` turns generated IDs into printed text while skipping special tokens.
+
+Hard readability rules
+- Render 3 to 5 main panels only.
+- Keep total visible text around 120 to 180 words, including title, panel labels, TA box, trap strip, and source strip.
+- Use short labels, arrows, tensor shapes, color, icons, and contrast instead of paragraphs.
+- Maximum 2 short lines per panel label. No label should exceed 12 words.
+- If the layout feels crowded, delete secondary detail before shrinking text.
+- Never shrink text below poster readability. Delete file anchors, constants, or captions before making tiny text.
+- Render only the visible content listed below. Guardrail facts are for correctness, not for display.
+- Do not render dense checklists, code listings, full function signatures, or long source paths.
+
+Visual style
+- White background, polished study-poster look, crisp technical diagram.
+- Left-to-right pipeline with one clear GPU/CPU boundary.
+- GPU hidden-state panels in green.
+- CPU host work in blue.
+- Token IDs, logits, and decoded output in orange/gold.
+- Misconceptions in a thin red trap strip.
+- Use a simple logits bar chart, an argmax highlight/crown, a token-ID row, and a console-output snippet.
+
+Visible content to render
+Render this as the main diagram, using these words or shorter equivalents:
+
+Panel 1: GPU final norm
+32 decoder blocks done
+`gpu_rmsnorm`: `[rows,4096] -> [rows,4096]`
+
+Panel 2: Last row only
+Copy last vector to CPU
+`forward_step -> last_hidden [batch,4096]`
+
+Panel 3: CPU lm_head logits
+`lm_head [128256,4096] x x_last [4096]`
+`logits [128256]`: one score per token
+
+Panel 4: Greedy token choice
+`next_id = argmax(logits)`
+`std::max_element`, no sampling
+
+Panel 5: Decode text; repeat only for multi-token
+IDs -> `decode_token(id)` -> text
+Multi-token stops at limit or `EOT_ID=128009`
+Make Panel 5 visually separate required one-token output from optional
+multi-token repetition. Do not imply the required one-token path has a decode
+loop.
+
+Add one small note near Panel 3:
+Repo exception: separate `lm_head`, not embeddings.
+
+Small TA answer box
+Title: 60-second TA script
+Text:
+We do not score every sequence row. The repo final-normalizes the decoder output, copies only the last hidden vector to CPU, scores all 128256 vocabulary IDs with a separate untied `lm_head`, chooses the largest logit, and decodes that generated ID into text.
+
+Small trap strip
+Title: Do not say
+Text:
+tied `lm_head` | GPU logits | all rows to vocab | sampling | EOT prints
+
+Bottom source strip
+Render as a very small footer, not a panel:
+`docs/assignment/llm_part2.md` | `src/inference_layer.cu` | `src/inference_loop.cu` | `src/inference.cu` | `main.cpp` | `assets/llama3/config.json`
+
+Guardrail facts the image must obey but should not render unless listed
+- Assignment story: after 32 decoder blocks, apply final RMSNorm with `model.norm.weight`; extract `x_last = X_out[s-1, :]`; compute `logits = x_last * W_lm^T`; choose greedy `argmax(logits)`; decode token ID with tokenizer `decode()`.
+- Exact constants: `NUM_LAYERS=32`, `EMBEDDING_DIM=4096`, `VOCAB_SIZE=128256`, `RMS_NORM_EPSILON=1e-5`, `EOT_ID=128009`.
+- `config.h` defines `EMBEDDING_DIM=4096`, `VOCAB_SIZE=128256`, and `NUM_LAYERS=32`.
+- `assets/llama3/config.json` has `hidden_size=4096`, `vocab_size=128256`, `eos_token_id=128009`, and `tie_word_embeddings=false`.
+- The assignment pitfall says `lm_head` may be shared with embeddings, but this repo's checkpoint is not tied. Do not show or imply tied/shared output weights.
+- `src/model_weights.cpp::ModelWeights::load_global()` loads `global/model_norm_weight.bin` and separate `global/lm_head_weight.bin`.
+- `include/model_weights.h` documents `lm_head [VOCAB_SIZE, EMBEDDING_DIM]`, stored row-major as `[V, d]`.
+- `src/inference_layer.cu::forward_step` runs the 32-layer decoder stack, advances the KV cache, applies final `gpu_rmsnorm`, copies only the last row per batch slot back to host, and returns `last_hidden [batch,4096]`.
+- `forward_step` returns hidden vectors, not logits and not token IDs.
+- `compute_lm_head_logits` is defined in `src/inference_layer.cu` and computes `lm_head @ x_last` in CPU host code with a loop over vocabulary rows.
+- `src/inference_loop.cu` calls `forward_step`, then calls `compute_lm_head_logits`, then uses `std::max_element` for greedy argmax.
+- Current CLI behavior is greedy. Do not invent temperature, top-p, or sampling controls.
+- One-token generation returns exactly one argmax token. Do not draw a repeated decode loop or EOT loop-control decision for this path.
+- Multi-token generation performs prefill, then repeats decode steps with `q_seq=1` until `max_new_tokens` or generated `EOT_ID=128009`.
+- Batched generation has one done flag per batch slot. Finished slots feed `EOT_ID` as a placeholder to keep batch shape fixed; later logits/tokens for finished slots are ignored.
+- `rows = batch * q_seq` in the repo implementation. For the assignment mental model with one prompt, the shape is `[s,4096]`.
+- `src/inference.cu::decode_token(int token_id)` uses `BPETokenizer::decode`.
+- `main.cpp` chooses the CLI path, loops over generated IDs, calls `decode_token(id)`, and prints decoded completions.
+- `BPETokenizer::decode` skips special tokens such as `EOT_ID`; do not show `<|eot_id|>` in printed user-facing output.
+- If CLI flags are shown at all, only use supported current flags such as `--max-tokens`, `--prompt`, and `--interactive`.
+
+Do-not-render rules
+- Do not render the full guardrail list.
+- Do not render all source anchors from the old prompt.
+- Do not render more than one TA Q&A item; use the short TA script instead.
+- Do not render implementation trivia about batch placeholders unless making a tiny optional batch inset.
+- Do not render long code snippets, full function signatures, full file paths, or dense tables.
+- Do not render the assignment/repo `lm_head` conflict as a long explanation; render only the short repo exception note and trap-strip item.
+- Do not render cache internals, RoPE, attention, FFN, or earlier decoder details; this infographic starts after the 32 decoder blocks.
+- Do not show logits computed inside `forward_step`; show logits after `forward_step` returns `last_hidden`.
+- Do not draw `lm_head` as a CUDA kernel.
+- Do not show every `[s,4096]` row flowing into the vocab projection.
+- Do not show special tokens printed as final text.
+- Do not title the required path as "repeat"; only multi-token generation
+  repeats.
+- Do not shrink text to fit secondary facts. Delete secondary facts instead.
